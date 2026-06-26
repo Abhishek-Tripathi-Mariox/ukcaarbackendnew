@@ -4,6 +4,8 @@ export { Ride } from './Ride';
 export type { IRide } from './Ride';
 export { Payment, Wallet, SavedPaymentMethod } from './Payment';
 export type { IPayment, IWallet, ISavedPaymentMethod } from './Payment';
+export { RechargeOffer } from './RechargeOffer';
+export type { IRechargeOffer } from './RechargeOffer';
 export { Chat, PromoCode } from './Chat';
 export type { IChat, IPromoCode } from './Chat';
 export { Notification } from './Notification';
@@ -43,6 +45,18 @@ export type { IZone, ZoneKind } from './Zone';
 export { SurgeRule } from './SurgeRule';
 export type { ISurgeRule } from './SurgeRule';
 export { Route } from './Route';
+export { ScheduledBooking } from './ScheduledBooking';
+export type { IScheduledBooking } from './ScheduledBooking';
+export { DriverJourney } from './DriverJourney';
+export type { IDriverJourney, JourneyStatus } from './DriverJourney';
+export { SubscriptionPlan, UserSubscription } from './Subscription';
+export type {
+  ISubscriptionPlan,
+  IUserSubscription,
+  PlanType,
+  PlanTarget,
+  SubscriptionStatus,
+} from './Subscription';
 export type {
   IRoute,
   IRouteStop,
@@ -54,6 +68,8 @@ export type {
 } from './Route';
 export { VehicleType } from './VehicleType';
 export type { IVehicleType } from './VehicleType';
+export { Settings } from './Settings';
+export type { ISettings } from './Settings';
 export { FuelType } from './FuelType';
 export type { IFuelType } from './FuelType';
 export { NotificationTemplate } from './NotificationTemplate';
@@ -62,6 +78,8 @@ export type {
   NotificationChannel,
   NotificationTemplateType,
 } from './NotificationTemplate';
+export { FAQ } from './FAQ';
+export type { IFAQ, FaqAudience } from './FAQ';
 export type {
   ILoyaltyTier,
   ILoyaltyAccount,

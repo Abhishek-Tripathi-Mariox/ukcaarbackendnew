@@ -2,6 +2,8 @@ import { Response } from 'express';
 import mongoose from 'mongoose';
 import { User, Ride, Payment } from '../models';
 import { AuthRequest } from '../middleware/auth';
+import { config } from '../config';
+import { createOrder } from './paymentController';
 
 const REGISTRATION_STEPS = [
   'service-type',
@@ -147,6 +149,12 @@ export const toggleOnline = async (req: AuthRequest, res: Response): Promise<voi
 
     const user = await User.findByIdAndUpdate(req.user!._id, updateData, { new: true });
 
+    console.log(
+      `[toggle-online] driver=${req.user!._id} isOnline=${isOnline} ` +
+      `coords=${lat && lng ? `${lat},${lng}` : 'none'} ` +
+      `stored=${JSON.stringify(user?.driverProfile?.currentLocation ?? null)}`,
+    );
+
     res.status(200).json({
       success: true,
       data: {
@@ -203,14 +211,46 @@ export const getNearbyDrivers = async (req: AuthRequest, res: Response): Promise
       isActive: true,
     }).select('firstName driverProfile.currentLocation driverProfile.rating driverProfile.vehicleMake driverProfile.vehicleModel driverProfile.vehicleColor');
 
-    // Filter by distance (simplified)
-    const nearbyDrivers = drivers.filter((driver) => {
-      if (!driver.driverProfile?.currentLocation) return false;
-      const dLat = driver.driverProfile.currentLocation.lat - lat;
-      const dLng = driver.driverProfile.currentLocation.lng - lng;
+    // Drivers who are an approved registration on an active scheduled
+    // Route run shuttle service — they should NOT appear on the
+    // instant/private map or count toward the "X cabs nearby" badge.
+    // Pulls the set in one query so the filter below is O(1) per driver.
+    const { Route } = await import('../models');
+    const scheduledRoutes = await Route.find({
+      isActive: true,
+      type: 'scheduled',
+      registeredDrivers: { $elemMatch: { status: 'approved' } },
+    })
+      .select('registeredDrivers')
+      .lean();
+    const scheduledDriverIds = new Set<string>();
+    for (const r of scheduledRoutes) {
+      for (const reg of (r.registeredDrivers ?? []) as any[]) {
+        if (reg?.status === 'approved' && reg?.driver) {
+          scheduledDriverIds.add(String(reg.driver));
+        }
+      }
+    }
+
+    // Filter by distance (simplified). Also drop any driver who's on a
+    // scheduled route — those are shuttle drivers, not instant cabs.
+    const withLocation = drivers.filter(
+      (d) =>
+        !!d.driverProfile?.currentLocation &&
+        !scheduledDriverIds.has(String(d._id)),
+    );
+    const nearbyDrivers = withLocation.filter((driver) => {
+      const dLat = driver.driverProfile!.currentLocation!.lat - lat;
+      const dLng = driver.driverProfile!.currentLocation!.lng - lng;
       const dist = Math.sqrt(dLat ** 2 + dLng ** 2) * 111; // rough km
       return dist <= radiusKm;
     });
+
+    console.log(
+      `[nearby] center=${lat},${lng} radius=${radiusKm}km ` +
+      `online=${drivers.length} withLocation=${withLocation.length} ` +
+      `inRadius=${nearbyDrivers.length}`,
+    );
 
     res.status(200).json({
       success: true,
@@ -235,32 +275,124 @@ export const getNearbyDrivers = async (req: AuthRequest, res: Response): Promise
 };
 
 /**
- * POST /api/v1/driver/onepass/subscribe
+ * POST /api/v1/drivers/onepass/subscribe
+ * OnePass is a PAID subscription. This no longer free-activates — it creates a
+ * Razorpay order for the chosen plan and delegates to the payment flow. The
+ * driver pays via native checkout, then /payments/verify-payment activates
+ * OnePass server-side. Kept for backward compatibility with the route.
  */
 export const subscribeOnePass = async (req: AuthRequest, res: Response): Promise<void> => {
+  req.body = { ...req.body, type: 'subscription' };
+  return createOrder(req, res);
+};
+
+/**
+ * GET /api/v1/drivers/me/ratings
+ * Aggregated rider feedback for the signed-in driver: overall average, count,
+ * a 7-day trend, the most common feedback tags, and recent comments. All
+ * derived from real Ride.rating data (customerToDriver).
+ */
+export const getMyRatings = async (req: AuthRequest, res: Response): Promise<void> => {
   try {
-    const { plan } = req.body; // weekly | monthly | annual
-    const durations: Record<string, number> = {
-      weekly: 7,
-      monthly: 30,
-      annual: 365,
-    };
+    const driverId = new mongoose.Types.ObjectId(req.user!._id);
+    const rated = await Ride.find({
+      driver: driverId,
+      'rating.customerToDriver': { $gt: 0 },
+    })
+      .select('rating completedAt createdAt')
+      .sort({ completedAt: -1, createdAt: -1 })
+      .limit(300)
+      .lean();
 
-    const days = durations[plan] || 30;
-    const expiry = new Date(Date.now() + days * 24 * 60 * 60 * 1000);
+    const scores = rated.map((r) => r.rating!.customerToDriver as number);
+    const totalRides = scores.length;
+    const overallRating = totalRides
+      ? Math.round((scores.reduce((a, b) => a + b, 0) / totalRides) * 10) / 10
+      : 0;
 
-    await User.findByIdAndUpdate(req.user!._id, {
-      'driverProfile.isOnePass': true,
-      'driverProfile.onePassExpiry': expiry,
+    // Recent text comments.
+    const comments = rated
+      .filter((r) => r.rating?.customerComment)
+      .slice(0, 10)
+      .map((r, i) => ({
+        id: String((r as any)._id ?? i),
+        stars: r.rating!.customerToDriver as number,
+        text: r.rating!.customerComment as string,
+        source: 'Rider',
+      }));
+
+    // Last-7-days trend: average rating per day (0 when no ratings that day).
+    const dayMs = 24 * 60 * 60 * 1000;
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+    const buckets: { sum: number; n: number }[] = Array.from({ length: 7 }, () => ({ sum: 0, n: 0 }));
+    rated.forEach((r) => {
+      const when = r.completedAt || r.createdAt;
+      if (!when) return;
+      const d = new Date(when);
+      d.setHours(0, 0, 0, 0);
+      const idx = 6 - Math.round((today.getTime() - d.getTime()) / dayMs);
+      if (idx >= 0 && idx < 7) {
+        buckets[idx].sum += r.rating!.customerToDriver as number;
+        buckets[idx].n += 1;
+      }
     });
+    const weeklyTrend = buckets.map((b) => (b.n ? Math.round((b.sum / b.n) * 10) / 10 : 0));
 
-    res.status(200).json({
+    // Metrics from the feedback tags riders actually selected, scaled to 0-5
+    // bars by relative frequency (the most-given tag = 5).
+    const tagCounts: Record<string, number> = {};
+    rated.forEach((r) =>
+      (r.rating?.tags ?? []).forEach((t: string) => {
+        tagCounts[t] = (tagCounts[t] ?? 0) + 1;
+      })
+    );
+    const topTags = Object.entries(tagCounts).sort((a, b) => b[1] - a[1]).slice(0, 3);
+    const maxTag = topTags[0]?.[1] || 1;
+    const metrics = topTags.map(([label, count]) => ({
+      label,
+      value: Math.round((count / maxTag) * 5 * 10) / 10,
+    }));
+
+    res.json({
       success: true,
-      message: 'One Pass subscription activated',
-      data: { plan, expiresAt: expiry },
+      data: { overallRating, totalRides, weeklyTrend, comments, metrics },
     });
   } catch (error) {
-    res.status(500).json({ success: false, message: 'Subscription failed' });
+    res.status(500).json({ success: false, message: 'Failed to load ratings' });
+  }
+};
+
+/**
+ * GET /api/v1/drivers/onepass/plans
+ * Server-authoritative OnePass plans (label + price + days) for the app to render.
+ */
+export const getOnePassPlans = async (_req: AuthRequest, res: Response): Promise<void> => {
+  const plans = Object.entries(config.onePass.plans).map(([key, p]) => ({
+    key,
+    label: p.label,
+    price: p.price,
+    days: p.days,
+    currency: config.onePass.currency,
+  }));
+  res.json({ success: true, data: { plans } });
+};
+
+/**
+ * GET /api/v1/drivers/onepass/status
+ * The driver's current OnePass state (active + expiry).
+ */
+export const getOnePassStatus = async (req: AuthRequest, res: Response): Promise<void> => {
+  try {
+    const user = await User.findById(req.user!._id).select(
+      'driverProfile.isOnePass driverProfile.onePassExpiry'
+    );
+    const dp: any = (user as any)?.driverProfile ?? {};
+    const expiry = dp.onePassExpiry ? new Date(dp.onePassExpiry) : null;
+    const isActive = !!dp.isOnePass && !!expiry && expiry > new Date();
+    res.json({ success: true, data: { isActive, expiresAt: expiry } });
+  } catch (error) {
+    res.status(500).json({ success: false, message: 'Failed to load OnePass status' });
   }
 };
 

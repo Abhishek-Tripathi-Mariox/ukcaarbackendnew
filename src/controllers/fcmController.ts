@@ -16,6 +16,23 @@ export const registerFcmToken = async (req: AuthRequest, res: Response): Promise
       return;
     }
 
+    // A single FCM token represents one physical device, and FCM
+    // delivers each push to ONE recipient per token. If driver A logged
+    // out on this phone and driver B logged in, the token would still be
+    // sitting in driver A's `fcmTokens` array — so pushes aimed at A
+    // would ring on B's phone.
+    //
+    // Fix: globally pull this token off any OTHER user before pushing it
+    // onto the current user. Multi-device for the same user is preserved
+    // (we only remove the token from *other* users; the current user's
+    // record gets it $push-ed below). Cheap — matched-set is tiny
+    // (only the previous owner, if any).
+    await User.updateMany(
+      { 'fcmTokens.token': token, _id: { $ne: req.user!._id } },
+      { $pull: { fcmTokens: { token } } },
+    );
+
+    // Same dedupe inside the current user's record (re-registration path).
     await User.updateOne(
       { _id: req.user!._id },
       { $pull: { fcmTokens: { token } } },
@@ -25,8 +42,14 @@ export const registerFcmToken = async (req: AuthRequest, res: Response): Promise
       { $push: { fcmTokens: { token, platform, updatedAt: new Date() } } },
     );
 
+    console.log(
+      `[fcm] registered token for user=${req.user!._id} platform=${platform} ` +
+      `token=...${token.slice(-8)}`,
+    );
+
     res.status(200).json({ success: true });
   } catch (error) {
+    console.error('[fcm] registerFcmToken error:', error);
     res.status(500).json({ success: false, message: 'Failed to register FCM token' });
   }
 };
@@ -59,10 +82,21 @@ export const unregisterFcmToken = async (req: AuthRequest, res: Response): Promi
  */
 export async function sendPushToUser(userId: string, payload: PushPayload): Promise<void> {
   const user = await User.findById(userId).select('fcmTokens');
-  if (!user || user.fcmTokens.length === 0) return;
+  if (!user || user.fcmTokens.length === 0) {
+    console.log(
+      `[fcm] sendPushToUser user=${userId} skipped: ` +
+        (!user ? 'user not found' : 'no fcmTokens registered'),
+    );
+    return;
+  }
 
   const tokens = user.fcmTokens.map((t) => t.token);
-  const { invalidTokens } = await sendPushToTokens(tokens, payload);
+  const kind = payload.data?.kind ?? 'generic';
+  const { successCount, invalidTokens } = await sendPushToTokens(tokens, payload);
+  console.log(
+    `[fcm] sendPushToUser user=${userId} kind=${kind} ` +
+      `tokens=${tokens.length} success=${successCount} invalid=${invalidTokens.length}`,
+  );
 
   if (invalidTokens.length > 0) {
     await User.updateOne(

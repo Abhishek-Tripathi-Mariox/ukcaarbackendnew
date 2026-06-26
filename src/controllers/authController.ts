@@ -1,7 +1,7 @@
 import { Request, Response } from 'express';
 import jwt from 'jsonwebtoken';
 import { validationResult } from 'express-validator';
-import { User, Wallet, AuditLog } from '../models';
+import { User, Wallet, Payment, AuditLog } from '../models';
 import { config } from '../config';
 import { AuthRequest } from '../middleware/auth';
 import { resolvePermissions } from '../config/permissions';
@@ -209,17 +209,113 @@ export const getMe = async (req: AuthRequest, res: Response): Promise<void> => {
       return;
     }
 
-    const wallet = await Wallet.findOne({ user: user._id });
+    const [wallet, referralCount] = await Promise.all([
+      Wallet.findOne({ user: user._id }),
+      User.countDocuments({ referredBy: user._id }),
+    ]);
 
     res.status(200).json({
       success: true,
       data: {
         user,
         wallet: wallet ? { balance: wallet.balance, currency: wallet.currency } : null,
+        referrals: { count: referralCount },
       },
     });
   } catch (error) {
     res.status(500).json({ success: false, message: 'Failed to fetch profile' });
+  }
+};
+
+/**
+ * POST /api/v1/auth/apply-referral
+ * Apply someone else's referral code to the signed-in account. This sets
+ * `referredBy` (the linkage that drives the referrer's referral count) and
+ * optionally credits a one-time wallet bonus (config.referral.bonus).
+ * Guards: code must exist, can't be your own, and can only be applied once.
+ */
+export const applyReferral = async (req: AuthRequest, res: Response): Promise<void> => {
+  try {
+    const code = String(req.body?.code ?? '').trim().toUpperCase();
+    if (!code) {
+      res.status(400).json({ success: false, message: 'Referral code is required' });
+      return;
+    }
+
+    const me = await User.findById(req.user!._id);
+    if (!me) {
+      res.status(404).json({ success: false, message: 'User not found' });
+      return;
+    }
+    if (me.referredBy) {
+      res.status(400).json({ success: false, message: 'A referral code has already been applied to your account' });
+      return;
+    }
+
+    const referrer = await User.findOne({ referralCode: code });
+    if (!referrer) {
+      res.status(404).json({ success: false, message: 'Invalid referral code' });
+      return;
+    }
+    if (String(referrer._id) === String(me._id)) {
+      res.status(400).json({ success: false, message: "You can't use your own referral code" });
+      return;
+    }
+
+    me.referredBy = referrer._id;
+    await me.save();
+
+    // One-time joiner bonus. Admin-configured value (Settings.referralBonus)
+    // takes precedence over the env default. Guarded by referredBy being
+    // previously unset, so it can never be claimed twice.
+    const settings = await (await import('../models')).Settings.findOne({ key: 'platform' })
+      .select('referralBonus')
+      .lean();
+    const bonus = settings?.referralBonus ?? config.referral.bonus;
+    if (bonus > 0) {
+      await Wallet.findOneAndUpdate(
+        { user: me._id },
+        { $inc: { balance: bonus } },
+        { upsert: true }
+      );
+      await Payment.create({
+        user: me._id,
+        type: 'bonus',
+        amount: bonus,
+        method: 'wallet',
+        status: 'completed',
+        description: `Referral bonus (code ${referrer.referralCode})`,
+      });
+    }
+
+    res.json({
+      success: true,
+      data: {
+        applied: true,
+        bonusCredited: bonus,
+        referrerName: [referrer.firstName, referrer.lastName].filter(Boolean).join(' '),
+      },
+    });
+  } catch (error) {
+    console.error('applyReferral error:', error);
+    res.status(500).json({ success: false, message: 'Failed to apply referral code' });
+  }
+};
+
+/**
+ * DELETE /api/v1/auth/me
+ * Self-service account deletion. Deactivates the account (isActive=false) —
+ * which the auth middleware and OTP login both already reject — so the user
+ * is immediately and permanently locked out. Data is retained for legal /
+ * settlement records and can be hard-purged by a back-office job.
+ */
+export const deleteAccount = async (req: AuthRequest, res: Response): Promise<void> => {
+  try {
+    await User.findByIdAndUpdate(req.user!._id, { isActive: false });
+    res.json({ success: true, message: 'Your account has been deleted.' });
+  } catch (error) {
+    console.error('deleteAccount error:', error);
+    res.status(500).json({ success: false, message: 'Failed to delete account' });
   }
 };
 

@@ -4,7 +4,10 @@ import {
   createRide,
   getRide,
   getRides,
+  getActiveRide,
   acceptRide,
+  rejectRide,
+  verifyRideOtp,
   updateRideStatus,
   cancelRide,
   rateRide,
@@ -22,6 +25,9 @@ router.use(authenticate);
 router.post('/estimate', estimateFare);
 router.post('/', createRideValidation, createRide);
 router.get('/', getRides);
+// /active must be declared before /:id so the literal path wins over the
+// param matcher; otherwise express treats "active" as an ObjectId.
+router.get('/active', getActiveRide);
 router.get('/:id', getRide);
 router.put('/:id/cancel', cancelRide);
 router.put('/:id/rate', rateRideValidation, rateRide);
@@ -29,6 +35,8 @@ router.put('/:id/simulate-complete', simulateComplete); // Demo only
 
 // ── Driver ──
 router.put('/:id/accept', authorize('driver'), acceptRide);
+router.put('/:id/reject', authorize('driver'), rejectRide);
+router.put('/:id/verify-otp', authorize('driver'), verifyRideOtp);
 router.put('/:id/status', authorize('driver'), updateRideStatus);
 
 export default router;

@@ -4,6 +4,9 @@ import {
   updateLocation,
   getNearbyDrivers,
   subscribeOnePass,
+  getOnePassPlans,
+  getOnePassStatus,
+  getMyRatings,
   getDriverProfile,
   getMyDashboard,
   getMyEarnings,
@@ -27,6 +30,9 @@ router.put('/location', authorize('driver'), updateLocation);
 router.get('/profile', authorize('driver'), getDriverProfile);
 router.get('/me/dashboard', authorize('driver'), getMyDashboard);
 router.get('/me/earnings', authorize('driver'), getMyEarnings);
+router.get('/me/ratings', authorize('driver'), getMyRatings);
+router.get('/onepass/plans', authorize('driver'), getOnePassPlans);
+router.get('/onepass/status', authorize('driver'), getOnePassStatus);
 router.post('/onepass/subscribe', authorize('driver'), subscribeOnePass);
 
 // ── Driver incentives (own view) ──

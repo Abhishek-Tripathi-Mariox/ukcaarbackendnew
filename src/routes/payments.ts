@@ -5,6 +5,7 @@ import {
   topUpWallet,
   createOrder,
   verifyPayment,
+  cancelOrder,
   razorpayWebhook,
   checkoutPage,
   checkoutCallback,
@@ -14,6 +15,12 @@ import {
   addSavedMethod,
   deleteSavedMethod,
   setDefaultMethod,
+  getWalletStatement,
+  getReceivedAmounts,
+  requestCashout,
+  payRideFromWallet,
+  confirmCashPayment,
+  getRechargeOffers,
 } from '../controllers/paymentController';
 import { authenticate, authorize } from '../middleware/auth';
 
@@ -29,9 +36,16 @@ router.use(authenticate);
 
 router.get('/', getPayments);
 router.get('/wallet', getWallet);
+router.get('/recharge-offers', getRechargeOffers);
+router.get('/wallet/statement', getWalletStatement);
+router.get('/wallet/received', authorize('driver'), getReceivedAmounts);
 router.post('/wallet/topup', topUpWallet);
+router.post('/wallet/pay-ride', payRideFromWallet);
+router.post('/rides/:rideId/confirm-cash', authorize('driver'), confirmCashPayment);
+router.post('/wallet/cashout', authorize('driver'), requestCashout);
 router.post('/create-order', createOrder);
 router.post('/verify-payment', verifyPayment);
+router.post('/cancel-order', cancelOrder);
 router.post('/promo/validate', validatePromo);
 
 // Saved payment methods

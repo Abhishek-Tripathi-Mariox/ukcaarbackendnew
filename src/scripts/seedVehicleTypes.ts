@@ -18,19 +18,20 @@ interface SeedItem {
   code: string;
   description?: string;
   sortOrder: number;
+  tier?: 'instant' | 'private';
 }
 
 const VEHICLE_TYPES: SeedItem[] = [
-  { name: '2 Wheeler', code: '2-wheeler', description: 'Bike / scooter', sortOrder: 10 },
-  { name: '3 Wheeler', code: '3-wheeler', description: 'Auto rickshaw / tuk-tuk', sortOrder: 20 },
-  { name: 'Hatchback', code: 'hatchback', description: 'Compact 5-seater (e.g. Swift, i20)', sortOrder: 30 },
-  { name: 'Sedan', code: 'sedan', description: 'Standard 4-door 5-seater (e.g. City, Verna)', sortOrder: 40 },
-  { name: 'SUV', code: 'suv', description: 'Sport utility vehicle, 5–7 seater', sortOrder: 50 },
-  { name: 'MUV', code: 'muv', description: 'Multi-utility / 6–7 seater (e.g. Ertiga, Innova)', sortOrder: 60 },
-  { name: 'Premium Sedan', code: 'premium-sedan', description: 'Luxury sedans for private rides', sortOrder: 70 },
-  { name: 'Premium SUV', code: 'premium-suv', description: 'Luxury SUVs for private rides', sortOrder: 80 },
-  { name: 'Mini Truck', code: 'mini-truck', description: 'Light goods carrier', sortOrder: 90 },
-  { name: 'Tempo Traveller', code: 'tempo-traveller', description: '12–17 seater for shuttle / scheduled rides', sortOrder: 100 },
+  { name: '2 Wheeler', code: '2-wheeler', description: 'Bike / scooter', sortOrder: 10, tier: 'instant' },
+  { name: '3 Wheeler', code: '3-wheeler', description: 'Auto rickshaw / tuk-tuk', sortOrder: 20, tier: 'instant' },
+  { name: 'Hatchback', code: 'hatchback', description: 'Compact 5-seater (e.g. Swift, i20)', sortOrder: 30, tier: 'instant' },
+  { name: 'Sedan', code: 'sedan', description: 'Standard 4-door 5-seater (e.g. City, Verna)', sortOrder: 40, tier: 'instant' },
+  { name: 'SUV', code: 'suv', description: 'Sport utility vehicle, 5–7 seater', sortOrder: 50, tier: 'instant' },
+  { name: 'MUV', code: 'muv', description: 'Multi-utility / 6–7 seater (e.g. Ertiga, Innova)', sortOrder: 60, tier: 'instant' },
+  { name: 'Premium Sedan', code: 'premium-sedan', description: 'Luxury sedans for private rides', sortOrder: 70, tier: 'private' },
+  { name: 'Premium SUV', code: 'premium-suv', description: 'Luxury SUVs for private rides', sortOrder: 80, tier: 'private' },
+  { name: 'Mini Truck', code: 'mini-truck', description: 'Light goods carrier', sortOrder: 90, tier: 'instant' },
+  { name: 'Tempo Traveller', code: 'tempo-traveller', description: '12–17 seater for shuttle / scheduled rides', sortOrder: 100, tier: 'instant' },
 ];
 
 const FUEL_TYPES: SeedItem[] = [

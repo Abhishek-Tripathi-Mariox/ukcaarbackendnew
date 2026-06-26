@@ -1,4 +1,5 @@
 import { Router, Request, Response } from 'express';
+import { istDateStr } from '../utils/date';
 import { stringify } from 'csv-stringify/sync';
 import { Ride, Payment, User, Settlement, TaxInvoice, SupportTicket } from '../models';
 import { requirePermission, AuthRequest } from '../middleware/auth';
@@ -341,7 +342,7 @@ router.get(
       const type = raw as ExportType;
       const rows = await fetchRows(type, req);
       const csv = stringify(rows, { header: true });
-      const ts = new Date().toISOString().slice(0, 10);
+      const ts = istDateStr();
       res.setHeader('Content-Type', 'text/csv; charset=utf-8');
       res.setHeader(
         'Content-Disposition',

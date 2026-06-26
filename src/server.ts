@@ -8,9 +8,10 @@ import rateLimit from 'express-rate-limit';
 import config from './config';
 import { connectDB } from './config/database';
 import { initFirebaseAdmin } from './config/firebase';
+import { startRideMaintenance } from './controllers/rideController';
 import routes from './routes';
 import { errorHandler, notFound } from './middleware/errorHandler';
-import { initializeSocket } from './socket';
+import { initializeSocket, initSocketRedisAdapter } from './socket';
 
 initFirebaseAdmin();
 
@@ -36,22 +37,22 @@ app.use(cors({
 }));
 
 // ── Rate limiting ──
-const limiter = rateLimit({
-  windowMs: 15 * 60 * 1000, // 15 min
-  max: config.rateLimit.max,
-  message: { success: false, message: 'Too many requests, please try again later' },
-  standardHeaders: true,
-  legacyHeaders: false,
-});
-app.use('/api/', limiter);
+// const limiter = rateLimit({
+//   windowMs: 15 * 60 * 1000, // 15 min
+//   max: config.rateLimit.max,
+//   message: { success: false, message: 'Too many requests, please try again later' },
+//   standardHeaders: true,
+//   legacyHeaders: false,
+// });
+// app.use('/api/', limiter);
 
-// Auth endpoints get stricter limiting
-const authLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000,
-  max: 20,
-  message: { success: false, message: 'Too many auth attempts' },
-});
-app.use('/api/v1/auth/', authLimiter);
+// // Auth endpoints get stricter limiting
+// const authLimiter = rateLimit({
+//   windowMs: 15 * 60 * 1000,
+//   max: 20,
+//   message: { success: false, message: 'Too many auth attempts' },
+// });
+// app.use('/api/v1/auth/', authLimiter);
 
 // ── Body parsing ──
 app.use(express.json({ limit: '10mb' }));
@@ -94,6 +95,14 @@ const startServer = async () => {
   try {
     // Connect to MongoDB
     await connectDB();
+
+    // Share Socket.IO rooms across instances via Redis (no-op when
+    // REDIS_ENABLED is unset). Must run after initializeSocket() above.
+    await initSocketRedisAdapter();
+
+    // Recover rides orphaned by a restart (in-memory auto-cancel timers are
+    // lost on reload) and keep sweeping stale 'searching' rides periodically.
+    startRideMaintenance();
 
     httpServer.listen(PORT, () => {
       console.log('═══════════════════════════════════════');

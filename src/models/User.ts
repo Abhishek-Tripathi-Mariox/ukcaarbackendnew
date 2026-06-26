@@ -26,6 +26,14 @@ export interface IUser extends Document {
   isActive: boolean;
   /** Date of birth — captured on the driver registration's "complete profile" step. */
   dob?: Date;
+  /**
+   * Refer-and-earn: a stable, user-facing code other drivers/riders can
+   * type at signup to credit this user. Generated lazily the first time
+   * it's read (see User.ts pre-save hook). Length 8, uppercase alphanum.
+   */
+  referralCode?: string;
+  /** UserId of whoever's referralCode was used when this account signed up. */
+  referredBy?: mongoose.Types.ObjectId;
   otp?: string;
   otpExpiry?: Date;
   refreshToken?: string;
@@ -44,6 +52,12 @@ export interface IUser extends Document {
     city?: string;
     state?: string;
     pincode?: string;
+  }[];
+
+  /** People notified when the user triggers an SOS from the Safety screen. */
+  emergencyContacts?: {
+    name: string;
+    phone: string;
   }[];
 
   // Driver-specific
@@ -88,6 +102,7 @@ export interface IUser extends Document {
      */
     registrationStep?:
       | 'service-type'
+      | 'choose-route'
       | 'vehicle-details'
       | 'owner-details'
       | 'driver-details'
@@ -171,6 +186,8 @@ const userSchema = new Schema<IUser>(
     isVerified: { type: Boolean, default: false },
     isActive: { type: Boolean, default: true },
     dob: { type: Date },
+    referralCode: { type: String, unique: true, sparse: true, uppercase: true, trim: true },
+    referredBy: { type: Schema.Types.ObjectId, ref: 'User' },
     otp: { type: String, select: false },
     otpExpiry: { type: Date, select: false },
     refreshToken: { type: String, select: false },
@@ -189,6 +206,13 @@ const userSchema = new Schema<IUser>(
         city: String,
         state: String,
         pincode: String,
+      },
+    ],
+
+    emergencyContacts: [
+      {
+        name: { type: String, required: true },
+        phone: { type: String, required: true },
       },
     ],
 
@@ -216,6 +240,7 @@ const userSchema = new Schema<IUser>(
         type: String,
         enum: [
           'service-type',
+          'choose-route',
           'vehicle-details',
           'owner-details',
           'driver-details',
@@ -294,6 +319,27 @@ userSchema.pre('save', async function (next) {
   if (!this.isModified('password') || !this.password) return next();
   const salt = await bcrypt.genSalt(12);
   this.password = await bcrypt.hash(this.password, salt);
+  next();
+});
+
+// ── Generate a referral code on first save when missing ──
+// Runs once per user. Collisions are rare with 8 alphanum chars (~2.8e12
+// space) but we retry on duplicate-key just in case.
+userSchema.pre('save', async function (next) {
+  if (this.referralCode) return next();
+  const ALPHA = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'; // skip 0/O/1/I for legibility
+  for (let attempt = 0; attempt < 5; attempt++) {
+    let code = '';
+    for (let i = 0; i < 8; i++) {
+      code += ALPHA[Math.floor(Math.random() * ALPHA.length)];
+    }
+    const existing = await mongoose.models.User.findOne({ referralCode: code });
+    if (!existing) {
+      this.referralCode = code;
+      return next();
+    }
+  }
+  // 5 collisions in a row is suspicious — let the unique index catch it.
   next();
 });
 

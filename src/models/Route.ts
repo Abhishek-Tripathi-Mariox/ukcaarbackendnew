@@ -26,6 +26,15 @@ export interface IRouteStop {
    * stop B (index j>i) = sum of `fareFromPrevious` for stops i+1..j.
    */
   fareFromPrevious?: number;
+  /**
+   * Indian 6-digit postal code captured from the autocomplete suggestion
+   * when the admin picked this stop. The customer scheduled-route lookup
+   * matches a rider's pincode against this field FIRST (more reliable
+   * than parsing the address string, which doesn't always contain a PIN
+   * — e.g. "Aligarh, Uttar Pradesh, India" has no PIN). Falls back to
+   * parsing `address` for legacy stops saved before this field existed.
+   */
+  pincode?: string;
 }
 
 export interface IRouteDeparture {
@@ -39,6 +48,7 @@ export interface IRouteSchedule {
   /** 0 = Sunday, 6 = Saturday. */
   daysOfWeek: number[];
   departures: IRouteDeparture[];
+  returnDepartures?: IRouteDeparture[];   // optional return-leg times
   seatPrice: number;
   vehicleType?: string; // e.g. 'shuttle', 'sedan'
   totalSeats?: number;
@@ -52,6 +62,19 @@ export interface IRouteDriverRegistration {
   approvedAt?: Date;
   approvedBy?: Types.ObjectId;
   note?: string;
+  /**
+   * Which departure slot the driver signed up for (index into
+   * `schedule.departures`). Required for scheduled routes; ignored for
+   * private routes.
+   */
+  departureIndex?: number;
+  /**
+   * If true, the driver also runs the return leg of this route at the
+   * matching return departure time. Used for routes where customers can
+   * book the same driver for the back-trip (e.g. airport shuttles where
+   * passengers fly out and back the same day with the same driver).
+   */
+  roundTrip?: boolean;
 }
 
 export interface IRoute extends Document {
@@ -83,9 +106,20 @@ const stopSchema = new Schema<IRouteStop>(
     lng: { type: Number, required: true, min: -180, max: 180 },
     sequence: { type: Number, required: true, min: 0 },
     fareFromPrevious: { type: Number, min: 0, default: 0 },
+    pincode: {
+      type: String,
+      trim: true,
+      // Only validate when actually set — legacy stops carry no PIN.
+      match: /^\d{4,10}$/,
+    },
   },
   { _id: false }
 );
+
+// Index pincode for fast customer-side route lookup by rider PIN.
+// MongoDB indexes subdoc array fields fine when accessed with `$elemMatch`
+// or dot notation, which is exactly how listScheduledRoutes queries.
+stopSchema.index({ pincode: 1 });
 
 const departureSchema = new Schema<IRouteDeparture>(
   {
@@ -103,6 +137,7 @@ const scheduleSchema = new Schema<IRouteSchedule>(
   {
     daysOfWeek: { type: [Number], default: [] },
     departures: { type: [departureSchema], default: [] },
+    returnDepartures: { type: [departureSchema], default: undefined },
     seatPrice: { type: Number, default: 0, min: 0 },
     vehicleType: { type: String, trim: true },
     totalSeats: { type: Number, min: 1 },
@@ -124,6 +159,8 @@ const driverRegistrationSchema = new Schema<IRouteDriverRegistration>(
     approvedAt: Date,
     approvedBy: { type: Schema.Types.ObjectId, ref: 'User' },
     note: String,
+    departureIndex: { type: Number, min: 0 },
+    roundTrip: { type: Boolean, default: false },
   },
   { _id: false }
 );

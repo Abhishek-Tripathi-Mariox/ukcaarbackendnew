@@ -10,6 +10,7 @@ import {
   ILoyaltyReward,
 } from '../models/Loyalty';
 import { IRide } from '../models/Ride';
+import { Wallet, Payment } from '../models';
 import mongoose from 'mongoose';
 
 /** Default: 1 point per ₹10 of fare. Override via env if needed. */
@@ -134,7 +135,12 @@ function generateRedemptionCode(): string {
 export async function redeemReward(args: {
   userId: mongoose.Types.ObjectId | string;
   rewardId: string;
-}): Promise<{ redemption: any; account: ILoyaltyAccount }> {
+}): Promise<{
+  redemption: any;
+  account: ILoyaltyAccount;
+  walletCredited: number;
+  fulfilled: 'wallet' | 'voucher';
+}> {
   const reward = (await LoyaltyReward.findById(args.rewardId)) as ILoyaltyReward | null;
   if (!reward) throw new Error('Reward not found');
   if (!reward.active) throw new Error('Reward not active');
@@ -178,7 +184,7 @@ export async function redeemReward(args: {
     throw new Error('Insufficient points');
   }
 
-  // Debit
+  // Debit the points cost.
   await addTransaction({
     userId: args.userId,
     type: 'redeem_reward',
@@ -187,7 +193,12 @@ export async function redeemReward(args: {
     reward: reward._id,
   });
 
-  // Issue redemption
+  // `wallet_credit` rewards are fulfilled immediately — the ₹ value lands in
+  // the customer's wallet and the redemption is recorded as already used.
+  // There's no code to apply later, so it can never become a dangling voucher.
+  const isWalletCredit = reward.type === 'wallet_credit';
+  let walletCredited = 0;
+
   const code = generateRedemptionCode();
   const expiresAt = reward.validUntil ?? new Date(Date.now() + 90 * 24 * 60 * 60 * 1000);
   const redemption = await LoyaltyRedemption.create({
@@ -200,15 +211,166 @@ export async function redeemReward(args: {
       pointsCost: reward.pointsCost,
     },
     code,
-    status: 'issued',
+    status: isWalletCredit ? 'used' : 'issued',
     issuedAt: new Date(),
+    usedAt: isWalletCredit ? new Date() : undefined,
     expiresAt,
   });
+
+  if (isWalletCredit) {
+    walletCredited = Math.max(0, Math.round(reward.value * 100) / 100);
+    if (walletCredited > 0) {
+      await Wallet.findOneAndUpdate(
+        { user: args.userId },
+        { $inc: { balance: walletCredited } },
+        { upsert: true }
+      );
+      await Payment.create({
+        user: args.userId,
+        type: 'bonus',
+        amount: walletCredited,
+        method: 'wallet',
+        status: 'completed',
+        description: `Loyalty reward credited: ${reward.name}`,
+      });
+    }
+  }
 
   await LoyaltyReward.updateOne(
     { _id: reward._id },
     { $inc: { totalRedemptionsCount: 1 } }
   );
 
-  return { redemption, account: await getOrCreateAccount(args.userId) };
+  return {
+    redemption,
+    account: await getOrCreateAccount(args.userId),
+    walletCredited,
+    fulfilled: isWalletCredit ? 'wallet' : 'voucher',
+  };
+}
+
+/** Round to 2 decimals. */
+function r2(n: number): number {
+  return Math.round(n * 100) / 100;
+}
+
+/**
+ * Discount a single redemption voucher is worth against `amount`.
+ * - ride_discount_flat / voucher → flat ₹ off (capped at the amount)
+ * - ride_discount_pct            → percentage of the amount
+ * - free_ride                    → the whole amount
+ * - wallet_credit                → 0 (handled at redeem time, not at booking)
+ */
+function voucherDiscountFor(snapshot: { type: string; value: number }, amount: number): number {
+  switch (snapshot.type) {
+    case 'ride_discount_flat':
+    case 'voucher':
+      return Math.min(snapshot.value, amount);
+    case 'ride_discount_pct':
+      return Math.min((amount * snapshot.value) / 100, amount);
+    case 'free_ride':
+      return amount;
+    default:
+      return 0;
+  }
+}
+
+export interface BookingLoyalty {
+  account: ILoyaltyAccount;
+  tierPct: number;
+  /** The voucher that will apply (best applicable, or the one named by code). */
+  voucher: {
+    redemptionId: mongoose.Types.ObjectId;
+    code: string;
+    type: string;
+    value: number;
+  } | null;
+}
+
+/**
+ * Resolve the loyalty context for a booking once: the customer's tier
+ * discount % and the voucher to apply. If `voucherCode` is given we use that
+ * exact issued voucher; otherwise we auto-pick the most valuable applicable
+ * one so a redeemed reward is never wasted. Pure read — nothing is consumed.
+ */
+export async function resolveBookingLoyalty(
+  userId: mongoose.Types.ObjectId | string,
+  voucherCode?: string
+): Promise<BookingLoyalty> {
+  const account = await getOrCreateAccount(userId);
+
+  let tierPct = 0;
+  if (account.tier) {
+    const tier = (await LoyaltyTier.findById(account.tier).lean()) as ILoyaltyTier | null;
+    if (tier?.rideDiscountPct) tierPct = tier.rideDiscountPct;
+  }
+
+  const now = new Date();
+  const baseQuery: any = {
+    user: userId,
+    status: 'issued',
+    $or: [{ expiresAt: { $exists: false } }, { expiresAt: null }, { expiresAt: { $gte: now } }],
+    'rewardSnapshot.type': { $ne: 'wallet_credit' },
+  };
+
+  let voucher: BookingLoyalty['voucher'] = null;
+  if (voucherCode) {
+    const red = await LoyaltyRedemption.findOne({ ...baseQuery, code: voucherCode.toUpperCase() }).lean();
+    if (red) {
+      voucher = {
+        redemptionId: red._id,
+        code: red.code,
+        type: red.rewardSnapshot.type,
+        value: red.rewardSnapshot.value,
+      };
+    }
+  } else {
+    // Auto-pick: prefer free_ride, then highest flat value, then highest pct.
+    const candidates = await LoyaltyRedemption.find(baseQuery).lean();
+    if (candidates.length) {
+      const score = (s: any) =>
+        s.rewardSnapshot.type === 'free_ride'
+          ? 1e9
+          : s.rewardSnapshot.type === 'ride_discount_flat' || s.rewardSnapshot.type === 'voucher'
+            ? s.rewardSnapshot.value
+            : s.rewardSnapshot.value; // pct
+      const best = candidates.sort((a, b) => score(b) - score(a))[0];
+      voucher = {
+        redemptionId: best._id,
+        code: best.code,
+        type: best.rewardSnapshot.type,
+        value: best.rewardSnapshot.value,
+      };
+    }
+  }
+
+  return { account, tierPct, voucher };
+}
+
+/**
+ * The total ₹ loyalty discount for `amount` given a resolved context: tier %
+ * plus the voucher's value. Capped so the fare never goes below zero.
+ */
+export function loyaltyDiscountForAmount(ctx: BookingLoyalty, amount: number): number {
+  if (amount <= 0) return 0;
+  const tierDiscount = (amount * ctx.tierPct) / 100;
+  let remaining = Math.max(0, amount - tierDiscount);
+  const voucherDiscount = ctx.voucher
+    ? voucherDiscountFor({ type: ctx.voucher.type, value: ctx.voucher.value }, remaining)
+    : 0;
+  return r2(Math.min(amount, tierDiscount + voucherDiscount));
+}
+
+/**
+ * Mark a redeemed voucher as consumed against a ride. Records a ledger note
+ * so the customer's transaction history shows where the voucher went.
+ */
+export async function consumeRedemption(
+  redemptionId: mongoose.Types.ObjectId | string,
+  rideId: mongoose.Types.ObjectId | string
+): Promise<void> {
+  await LoyaltyRedemption.updateOne(
+    { _id: redemptionId, status: 'issued' },
+    { $set: { status: 'used', usedAt: new Date(), usedRide: rideId } }
+  );
 }

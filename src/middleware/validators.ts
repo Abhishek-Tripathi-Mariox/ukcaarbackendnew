@@ -28,10 +28,15 @@ export const updateProfileValidation = [
 ];
 
 export const createRideValidation = [
+  // rideType is now an admin-defined VehicleType.code, not a fixed enum.
+  // We just enforce shape (non-empty slug) and let the dispatcher resolve
+  // it against the live catalogue — unknown codes fall back to tier-only
+  // filtering rather than rejecting the request outright.
   body('rideType')
     .notEmpty()
-    .isIn(['economy', 'comfort', 'premium', 'xl', 'electric'])
-    .withMessage('Invalid ride type'),
+    .isString()
+    .withMessage('rideType is required')
+    .isLength({ max: 64 }),
   body('pickup.address').notEmpty().withMessage('Pickup address is required'),
   body('pickup.lat').isFloat({ min: -90, max: 90 }),
   body('pickup.lng').isFloat({ min: -180, max: 180 }),

@@ -1,6 +1,6 @@
 import { Router, Request, Response } from 'express';
 import mongoose from 'mongoose';
-import { Route } from '../models';
+import { Route, User } from '../models';
 import { requirePermission } from '../middleware/auth';
 import { auditLog } from '../middleware/audit';
 import { PERMISSIONS } from '../config/permissions';
@@ -68,19 +68,33 @@ function validateSchedule(schedule: any): string | null {
 function normaliseBody(body: any) {
   const out: any = { ...body };
   if (Array.isArray(out.stops)) {
-    out.stops = out.stops.map((s: any, i: number) => ({
-      name: String(s.name).trim(),
-      address: s.address ? String(s.address).trim() : undefined,
-      lat: Number(s.lat),
-      lng: Number(s.lng),
-      sequence: typeof s.sequence === 'number' ? s.sequence : i,
-      fareFromPrevious:
-        i === 0
-          ? 0
-          : s.fareFromPrevious === undefined || s.fareFromPrevious === null || s.fareFromPrevious === ''
-          ? 0
-          : Number(s.fareFromPrevious),
-    }));
+    out.stops = out.stops.map((s: any, i: number) => {
+      // Accept an explicit pincode from the admin form. As a safety net,
+      // try to parse one out of the address string when the form didn't
+      // carry it (older clients, manually-typed addresses, etc.).
+      const explicit =
+        typeof s.pincode === 'string' ? s.pincode.trim() : undefined;
+      const fromAddress: string | undefined = s.address
+        ? (String(s.address).match(/\b\d{6}\b/g) ?? []).pop()
+        : undefined;
+      const pincode = explicit || fromAddress || undefined;
+      return {
+        name: String(s.name).trim(),
+        address: s.address ? String(s.address).trim() : undefined,
+        lat: Number(s.lat),
+        lng: Number(s.lng),
+        sequence: typeof s.sequence === 'number' ? s.sequence : i,
+        fareFromPrevious:
+          i === 0
+            ? 0
+            : s.fareFromPrevious === undefined ||
+              s.fareFromPrevious === null ||
+              s.fareFromPrevious === ''
+            ? 0
+            : Number(s.fareFromPrevious),
+        pincode,
+      };
+    });
   }
   return out;
 }
@@ -232,6 +246,78 @@ router.delete(
 // ──────────────────────────────────────────────────────────────────
 // Driver registrations on a route
 // ──────────────────────────────────────────────────────────────────
+
+// Admin directly assigns a driver to a route. Unlike the self-registration
+// flow (driver app → POST /routes/:id/register, which lands as `pending`),
+// an admin assignment is trusted and lands as `approved` straight away so
+// the driver is immediately operational on the route. Drivers already on
+// the route are rejected here — the UI disables them in the picker, and the
+// admin should approve/reject/remove the existing entry instead.
+router.post(
+  '/routes/:id/drivers',
+  requirePermission(PERMISSIONS.MANAGE_ROUTES),
+  auditLog({ action: 'route.driver.assign', resourceType: 'route' }),
+  async (req: Request, res: Response) => {
+    try {
+      const { id } = req.params;
+      const { driverId, status = 'approved', note } = req.body || {};
+
+      if (!mongoose.isValidObjectId(driverId)) {
+        res.status(400).json({ success: false, message: 'Invalid driver id' });
+        return;
+      }
+      if (!['pending', 'approved'].includes(status)) {
+        res
+          .status(400)
+          .json({ success: false, message: 'status must be "pending" or "approved"' });
+        return;
+      }
+
+      const driver = await User.findOne({ _id: driverId, role: 'driver' }).select('_id');
+      if (!driver) {
+        res.status(404).json({ success: false, message: 'Driver not found' });
+        return;
+      }
+
+      const route = await Route.findById(id);
+      if (!route) {
+        res.status(404).json({ success: false, message: 'Route not found' });
+        return;
+      }
+
+      const already = route.registeredDrivers.some(
+        (d) => String(d.driver) === String(driverId)
+      );
+      if (already) {
+        res
+          .status(409)
+          .json({ success: false, message: 'Driver is already on this route' });
+        return;
+      }
+
+      const reg: any = {
+        driver: driverId,
+        status,
+        registeredAt: new Date(),
+      };
+      if (note !== undefined) reg.note = note;
+      if (status === 'approved') {
+        reg.approvedAt = new Date();
+        reg.approvedBy = (req as any).user?._id;
+      }
+      route.registeredDrivers.push(reg);
+      await route.save();
+
+      const populated = await Route.findById(id).populate(
+        'registeredDrivers.driver',
+        'firstName lastName phone email'
+      );
+      res.status(201).json({ success: true, data: { route: populated } });
+    } catch (err: any) {
+      res.status(400).json({ success: false, message: err.message || 'Assign failed' });
+    }
+  }
+);
 
 router.patch(
   '/routes/:id/drivers/:driverId',

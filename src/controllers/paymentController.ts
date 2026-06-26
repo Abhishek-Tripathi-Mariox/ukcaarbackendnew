@@ -1,7 +1,7 @@
 import { Request, Response } from 'express';
 import crypto from 'crypto';
 import Razorpay from 'razorpay';
-import { Payment, Wallet, User, SavedPaymentMethod } from '../models';
+import { Payment, Wallet, User, SavedPaymentMethod, RechargeOffer } from '../models';
 import { AuthRequest } from '../middleware/auth';
 import { config } from '../config';
 
@@ -9,6 +9,86 @@ const razorpay = new Razorpay({
   key_id: config.razorpay.keyId,
   key_secret: config.razorpay.keySecret,
 });
+
+// GST applied to wallet recharges. Keep in sync with the customer app's
+// WalletTopUpScreen so the displayed breakdown matches what's charged.
+const WALLET_GST_RATE = 0.18;
+
+interface RechargeQuote {
+  denomination: number; // base recharge value (credited as principal)
+  bonus: number; // extra wallet credit on top of the denomination
+  discount: number; // absolute INR knocked off the payable price
+  gst: number;
+  total: number; // amount actually charged via Razorpay
+  walletCredit: number; // amount credited to the wallet on success
+}
+
+/**
+ * Single source of truth for wallet-recharge math. Both preset offers and
+ * custom amounts route through here so the charged total and the credited
+ * balance are always computed server-side — never from client-sent values.
+ */
+function computeRechargeQuote(opts: {
+  amount: number;
+  bonusAmount?: number;
+  discountPercent?: number;
+}): RechargeQuote {
+  const denomination = Math.max(0, Math.round(opts.amount));
+  const bonus = Math.max(0, Math.round(opts.bonusAmount || 0));
+  const discountPercent = Math.min(Math.max(opts.discountPercent || 0, 0), 100);
+  const discount = Math.round((denomination * discountPercent) / 100);
+  const payableBeforeGst = Math.max(0, denomination - discount);
+  const gst = Math.round(payableBeforeGst * WALLET_GST_RATE);
+  const total = payableBeforeGst + gst;
+  const walletCredit = denomination + bonus;
+  return { denomination, bonus, discount, gst, total, walletCredit };
+}
+
+/**
+ * GET /api/v1/payments/recharge-offers
+ * Active recharge offers for the customer app's wallet top-up screen, sorted
+ * by display order. Returns a computed price breakdown per offer so the client
+ * doesn't have to duplicate the GST/discount formula.
+ */
+export const getRechargeOffers = async (
+  req: AuthRequest,
+  res: Response,
+): Promise<void> => {
+  try {
+    const now = new Date();
+    const offers = await RechargeOffer.find({
+      isActive: true,
+      $and: [
+        { $or: [{ validFrom: { $exists: false } }, { validFrom: null }, { validFrom: { $lte: now } }] },
+        { $or: [{ validUntil: { $exists: false } }, { validUntil: null }, { validUntil: { $gte: now } }] },
+      ],
+    })
+      .sort({ order: 1, amount: 1 })
+      .lean();
+
+    const items = offers.map((o: any) => {
+      const quote = computeRechargeQuote({
+        amount: o.amount,
+        bonusAmount: o.bonusAmount,
+        discountPercent: o.discountPercent,
+      });
+      return {
+        _id: String(o._id),
+        amount: o.amount,
+        bonusAmount: o.bonusAmount || 0,
+        discountPercent: o.discountPercent || 0,
+        label: o.label || '',
+        isPopular: !!o.isPopular,
+        ...quote,
+      };
+    });
+
+    res.status(200).json({ success: true, data: { offers: items } });
+  } catch (error) {
+    console.error('getRechargeOffers error:', error);
+    res.status(500).json({ success: false, message: 'Failed to fetch recharge offers' });
+  }
+};
 
 /**
  * GET /api/v1/payments
@@ -68,38 +148,134 @@ export const getWallet = async (req: AuthRequest, res: Response): Promise<void> 
  * POST /api/v1/payments/create-order
  * Create a Razorpay order for wallet topup or ride payment
  */
+/**
+ * Activate OnePass for the driver on a verified subscription payment. The plan
+ * (and therefore the validity period) was fixed server-side at order time, so
+ * the client can't extend it. Extends from the current expiry if still active.
+ */
+async function activateOnePassFromPayment(payment: any): Promise<void> {
+  if (payment.type !== 'subscription' || !payment.subscriptionPlan) return;
+  const planDef = config.onePass.plans[payment.subscriptionPlan];
+  if (!planDef) return;
+
+  const user = await User.findById(payment.user).select('driverProfile.onePassExpiry');
+  const currentExpiry = (user as any)?.driverProfile?.onePassExpiry;
+  const base = currentExpiry && new Date(currentExpiry) > new Date() ? new Date(currentExpiry) : new Date();
+  const expiry = new Date(base.getTime() + planDef.days * 24 * 60 * 60 * 1000);
+
+  await User.findByIdAndUpdate(payment.user, {
+    'driverProfile.isOnePass': true,
+    'driverProfile.onePassExpiry': expiry,
+  });
+}
+
 export const createOrder = async (req: AuthRequest, res: Response): Promise<void> => {
   try {
-    const { amount, type = 'wallet_topup', rideId, methodPreference } = req.body;
-    if (!amount || amount <= 0) {
+    const {
+      amount,
+      type = 'wallet_topup',
+      rideId,
+      scheduledRouteId,
+      methodPreference,
+      offerId,
+      plan,
+    } = req.body;
+
+    // For wallet top-ups the charged total and the credited balance are
+    // computed server-side from the offer (or the custom amount) so the
+    // bonus/discount can't be tampered with from the client.
+    let chargeAmount = Number(amount);
+    let walletCredit: number | undefined;
+    let bonusAmount: number | undefined;
+    let offerDoc: any = null;
+    let subscriptionPlan: string | undefined;
+
+    if (type === 'subscription') {
+      // OnePass purchase — price comes from the server-side plan table; the
+      // client only chooses a plan key. Activation happens on verify.
+      const planDef = config.onePass.plans[String(plan)];
+      if (!planDef) {
+        res.status(400).json({ success: false, message: 'Invalid OnePass plan' });
+        return;
+      }
+      chargeAmount = planDef.price;
+      subscriptionPlan = String(plan);
+    } else if (type === 'wallet_topup') {
+      let quote: RechargeQuote;
+      if (offerId) {
+        offerDoc = await RechargeOffer.findById(offerId);
+        if (!offerDoc || !offerDoc.isActive) {
+          res.status(400).json({ success: false, message: 'Recharge offer is unavailable' });
+          return;
+        }
+        quote = computeRechargeQuote({
+          amount: offerDoc.amount,
+          bonusAmount: offerDoc.bonusAmount,
+          discountPercent: offerDoc.discountPercent,
+        });
+      } else {
+        if (!amount || amount <= 0) {
+          res.status(400).json({ success: false, message: 'Invalid amount' });
+          return;
+        }
+        quote = computeRechargeQuote({ amount: Number(amount) });
+      }
+      chargeAmount = quote.total;
+      walletCredit = quote.walletCredit;
+      bonusAmount = quote.bonus;
+    } else if (!amount || amount <= 0) {
       res.status(400).json({ success: false, message: 'Invalid amount' });
       return;
     }
 
     // Razorpay expects amount in paise (smallest currency unit)
     const order = await razorpay.orders.create({
-      amount: Math.round(amount * 100),
+      amount: Math.round(chargeAmount * 100),
       currency: 'INR',
       receipt: `rcpt_${Date.now()}`,
       notes: {
         userId: req.user!._id.toString(),
         type,
         ...(rideId && { rideId }),
+        ...(offerId && { offerId }),
+        // Stash the route id on the order for traceability — the
+        // actual ScheduledBooking is created client-side after verify,
+        // since the seat reservation has to be atomic against other
+        // riders. notes is searchable in the Razorpay dashboard which
+        // helps with reconciliation if a payment lands without a
+        // matching booking.
+        ...(scheduledRouteId && { scheduledRouteId }),
       },
     });
 
-    // Create a pending payment record
+    // Create a pending payment record. Scheduled bookings don't have a
+    // Ride doc — the route id is recorded in the description for now;
+    // the booking record itself is created in `bookSeats` after the
+    // payment verifies, and we link it back via the payment row.
+    const description =
+      type === 'wallet_topup'
+        ? `Wallet top-up: ₹${chargeAmount}${
+            walletCredit && walletCredit !== chargeAmount ? ` (₹${walletCredit} credited)` : ''
+          }`
+        : type === 'subscription'
+        ? `OnePass ${subscriptionPlan} subscription: ₹${chargeAmount}`
+        : type === 'scheduled_booking'
+        ? `Scheduled booking: ₹${amount}${scheduledRouteId ? ` (route ${scheduledRouteId})` : ''}`
+        : `Ride payment: ₹${amount}`;
+
     const payment = await Payment.create({
       user: req.user!._id,
       ...(rideId && { ride: rideId }),
       type,
-      amount,
+      amount: chargeAmount,
+      ...(walletCredit !== undefined && { walletCredit }),
+      ...(bonusAmount !== undefined && { bonusAmount }),
+      ...(offerDoc && { rechargeOffer: offerDoc._id }),
+      ...(subscriptionPlan && { subscriptionPlan }),
       method: methodPreference === 'wallet' ? 'wallet' : 'card',
       status: 'pending',
       razorpayOrderId: order.id,
-      description: type === 'wallet_topup'
-        ? `Wallet top-up: ₹${amount}`
-        : `Ride payment: ₹${amount}`,
+      description,
     });
 
     res.status(200).json({
@@ -110,6 +286,13 @@ export const createOrder = async (req: AuthRequest, res: Response): Promise<void
         currency: order.currency,
         paymentId: payment._id,
         keyId: config.razorpay.keyId,
+        // Echo back the server-computed top-up breakdown so the client shows
+        // exactly what will be charged/credited.
+        ...(type === 'wallet_topup' && {
+          chargeAmount,
+          walletCredit,
+          bonusAmount,
+        }),
       },
     });
   } catch (error) {
@@ -189,10 +372,11 @@ export const checkoutCallback = async (req: Request, res: Response): Promise<voi
         if (payment.type === 'wallet_topup') {
           await Wallet.findOneAndUpdate(
             { user: payment.user },
-            { $inc: { balance: payment.amount } },
+            { $inc: { balance: payment.walletCredit ?? payment.amount } },
             { upsert: true },
           );
         }
+        await activateOnePassFromPayment(payment);
       }
     }
   }
@@ -270,9 +454,32 @@ export const verifyPayment = async (req: AuthRequest, res: Response): Promise<vo
     if (payment.type === 'wallet_topup') {
       await Wallet.findOneAndUpdate(
         { user: payment.user },
-        { $inc: { balance: payment.amount } },
+        { $inc: { balance: payment.walletCredit ?? payment.amount } },
         { upsert: true, new: true },
       );
+    }
+
+    // If OnePass subscription, activate it now that payment is verified.
+    await activateOnePassFromPayment(payment);
+
+    // If this Razorpay order was paying off a ride, flip the ride from
+    // `payment_pending` → `completed` and settle the driver's earnings.
+    // Without this the ride stayed `payment_pending` forever and the
+    // receipt screen kept showing "Proceed to Payment" on relaunch.
+    if (payment.type === 'ride_payment' && payment.ride) {
+      try {
+        const { finalizeRideSettlement } = await import('./rideController');
+        const settled = await finalizeRideSettlement(String(payment.ride), 'card');
+        const { emitToRide, emitToUser } = await import('../socket');
+        if (settled) {
+          const evt = { rideId: settled._id, status: 'completed', ride: settled };
+          emitToRide(String(settled._id), 'ride:status', evt);
+          emitToUser(String(settled.customer), 'ride:status', evt);
+          if (settled.driver) emitToUser(String(settled.driver), 'ride:status', evt);
+        }
+      } catch (e) {
+        console.error('[verifyPayment] settle failed:', e);
+      }
     }
 
     const wallet = await Wallet.findOne({ user: payment.user });
@@ -288,6 +495,192 @@ export const verifyPayment = async (req: AuthRequest, res: Response): Promise<vo
   } catch (error) {
     console.error('verifyPayment error:', error);
     res.status(500).json({ success: false, message: 'Payment verification failed' });
+  }
+};
+
+/**
+ * POST /api/v1/payments/wallet/pay-ride
+ *
+ * Debits the rider's wallet for a completed ride. Atomic enough for our
+ * traffic: refetch → check sufficiency → decrement → save. Returns the
+ * new balance + the created Payment record so the customer can update
+ * Redux without a follow-up /wallet GET.
+ *
+ * Refuses to debit if:
+ *   - The ride doesn't belong to the caller.
+ *   - The ride isn't in `completed` status (we don't bill a trip that
+ *     hasn't ended).
+ *   - The ride is already marked paid — prevents double-debits if the
+ *     customer hammers the button while the response is in flight.
+ *   - The wallet balance is below the fare. Caller must fall through to
+ *     Razorpay (top-up flow handled separately on the client).
+ */
+export const payRideFromWallet = async (
+  req: AuthRequest,
+  res: Response,
+): Promise<void> => {
+  try {
+    const { rideId } = req.body as { rideId?: string };
+    if (!rideId) {
+      res.status(400).json({ success: false, message: 'rideId is required' });
+      return;
+    }
+
+    const { Ride } = await import('../models');
+    const ride = await Ride.findById(rideId);
+    if (!ride) {
+      res.status(404).json({ success: false, message: 'Ride not found' });
+      return;
+    }
+    if (String(ride.customer) !== String(req.user!._id)) {
+      res.status(403).json({ success: false, message: 'Not your ride' });
+      return;
+    }
+    // We now bill the rider during the `payment_pending` stage — the trip
+    // has physically ended (driver pressed "End trip") but the ride is
+    // not yet `completed`. Settlement here flips it.
+    if (ride.status !== 'payment_pending') {
+      res.status(400).json({
+        success: false,
+        message:
+          ride.status === 'completed'
+            ? 'This ride is already paid'
+            : 'Ride is not awaiting payment',
+      });
+      return;
+    }
+    if (ride.paymentStatus === 'completed') {
+      res.status(400).json({
+        success: false,
+        message: 'This ride is already paid',
+      });
+      return;
+    }
+
+    const amount = Number(ride.actualFare ?? ride.estimatedFare ?? 0);
+    if (!(amount > 0)) {
+      res.status(400).json({ success: false, message: 'Ride amount unavailable' });
+      return;
+    }
+
+    let wallet = await Wallet.findOne({ user: req.user!._id });
+    if (!wallet) wallet = await Wallet.create({ user: req.user!._id, balance: 0 });
+
+    if (wallet.balance < amount) {
+      res.status(400).json({
+        success: false,
+        message: 'Insufficient wallet balance',
+        data: { walletBalance: wallet.balance, required: amount },
+      });
+      return;
+    }
+
+    wallet.balance = Math.round((wallet.balance - amount) * 100) / 100;
+    await wallet.save();
+
+    // Customer-side payment row (the helper skips this when method='wallet'
+    // so we can own the row from here and have a clean wallet statement
+    // entry tied to this ride).
+    const payment = await Payment.create({
+      user: req.user!._id,
+      ride: ride._id,
+      type: 'ride_payment',
+      amount,
+      method: 'wallet',
+      status: 'completed',
+      description: `Ride payment: ₹${amount}`,
+    });
+
+    // Move the ride to `completed`, credit the driver, write the
+    // commission/earnings rows, fire incentives — all centralised in the
+    // helper so wallet/Razorpay/cash paths stay in sync.
+    const { finalizeRideSettlement } = await import('./rideController');
+    const settled = await finalizeRideSettlement(String(ride._id), 'wallet');
+
+    // Tell the customer & driver (and any admin live tracker) the trip is
+    // officially done. The customer's RideComplete screen listens for this
+    // to refresh from the new ride doc and offer the rating sheet.
+    try {
+      const { emitToRide, emitToUser } = await import('../socket');
+      const payload = { rideId: ride._id, status: 'completed', ride: settled };
+      emitToRide(String(ride._id), 'ride:status', payload);
+      emitToUser(String(ride.customer), 'ride:status', payload);
+      if (ride.driver) emitToUser(String(ride.driver), 'ride:status', payload);
+    } catch (e) {
+      console.warn('[wallet-pay] socket emit failed:', e);
+    }
+
+    res.status(200).json({
+      success: true,
+      message: 'Ride paid from wallet',
+      data: {
+        payment,
+        wallet: { balance: wallet.balance, currency: wallet.currency },
+        ride: settled,
+      },
+    });
+  } catch (error) {
+    console.error('payRideFromWallet error:', error);
+    res.status(500).json({ success: false, message: 'Wallet payment failed' });
+  }
+};
+
+/**
+ * POST /api/v1/payments/rides/:rideId/confirm-cash
+ *
+ * Driver-only. The driver collected cash from the rider at drop-off, so
+ * we flip the ride from `payment_pending` to `completed` and settle the
+ * driver's earnings. The customer-side Payment row is created inside the
+ * settlement helper with method='cash'.
+ */
+export const confirmCashPayment = async (
+  req: AuthRequest,
+  res: Response,
+): Promise<void> => {
+  try {
+    const { rideId } = req.params;
+    const { Ride } = await import('../models');
+    const ride = await Ride.findById(rideId);
+    if (!ride) {
+      res.status(404).json({ success: false, message: 'Ride not found' });
+      return;
+    }
+    if (String(ride.driver) !== String(req.user!._id)) {
+      res.status(403).json({ success: false, message: 'Not your ride' });
+      return;
+    }
+    if (ride.status !== 'payment_pending') {
+      res.status(400).json({
+        success: false,
+        message:
+          ride.status === 'completed'
+            ? 'This ride is already settled'
+            : 'Ride is not awaiting payment',
+      });
+      return;
+    }
+
+    const { finalizeRideSettlement } = await import('./rideController');
+    const settled = await finalizeRideSettlement(String(ride._id), 'cash');
+
+    try {
+      const { emitToRide, emitToUser } = await import('../socket');
+      const payload = { rideId: ride._id, status: 'completed', ride: settled };
+      emitToRide(String(ride._id), 'ride:status', payload);
+      emitToUser(String(ride.customer), 'ride:status', payload);
+      emitToUser(String(ride.driver), 'ride:status', payload);
+    } catch (e) {
+      console.warn('[cash-confirm] socket emit failed:', e);
+    }
+
+    res.status(200).json({
+      success: true,
+      message: 'Cash collection confirmed',
+      data: { ride: settled },
+    });
+  } catch (error) {
+    console.error('confirmCashPayment error:', error);
+    res.status(500).json({ success: false, message: 'Cash confirmation failed' });
   }
 };
 
@@ -327,9 +720,28 @@ export const razorpayWebhook = async (req: Request, res: Response): Promise<void
         if (payment.type === 'wallet_topup') {
           await Wallet.findOneAndUpdate(
             { user: payment.user },
-            { $inc: { balance: payment.amount } },
+            { $inc: { balance: payment.walletCredit ?? payment.amount } },
             { upsert: true },
           );
+        }
+        // Mirror of the verifyPayment hook — if the webhook captures
+        // before the client's verify call lands (async server-to-server
+        // path), still settle the ride. The helper is idempotent so a
+        // later verify call won't double-credit.
+        if (payment.type === 'ride_payment' && payment.ride) {
+          try {
+            const { finalizeRideSettlement } = await import('./rideController');
+            const settled = await finalizeRideSettlement(String(payment.ride), 'card');
+            const { emitToRide, emitToUser } = await import('../socket');
+            if (settled) {
+              const evt = { rideId: settled._id, status: 'completed', ride: settled };
+              emitToRide(String(settled._id), 'ride:status', evt);
+              emitToUser(String(settled.customer), 'ride:status', evt);
+              if (settled.driver) emitToUser(String(settled.driver), 'ride:status', evt);
+            }
+          } catch (e) {
+            console.error('[webhook] settle failed:', e);
+          }
         }
       }
     }
@@ -347,6 +759,233 @@ export const razorpayWebhook = async (req: Request, res: Response): Promise<void
 export const topUpWallet = async (req: AuthRequest, res: Response): Promise<void> => {
   // Redirect to create-order flow
   return createOrder(req, res);
+};
+
+/**
+ * POST /api/v1/payments/cancel-order
+ * Marks a pending Payment row as 'failed' when the user dismisses the
+ * Razorpay sheet without paying. Without this, the row sits in 'pending'
+ * forever and shows up in the wallet statement as a yellow "Pending" badge
+ * even though the user has long since moved on.
+ *
+ * The check on { user, status:'pending' } prevents an attacker from
+ * flipping someone else's completed payment to failed.
+ */
+export const cancelOrder = async (req: AuthRequest, res: Response): Promise<void> => {
+  try {
+    const { razorpay_order_id } = req.body;
+    if (!razorpay_order_id) {
+      res.status(400).json({ success: false, message: 'razorpay_order_id required' });
+      return;
+    }
+    await Payment.findOneAndUpdate(
+      {
+        razorpayOrderId: razorpay_order_id,
+        user: req.user!._id,
+        status: 'pending',
+      },
+      { status: 'failed' },
+    );
+    res.status(200).json({ success: true });
+  } catch (error) {
+    console.error('cancelOrder error:', error);
+    res.status(500).json({ success: false, message: 'Failed to mark order cancelled' });
+  }
+};
+
+/**
+ * GET /api/v1/payments/wallet/statement?page=1&limit=20
+ * Paginated full transaction history grouped by month on the client.
+ * Returns the user's Payment records, newest first.
+ */
+export const getWalletStatement = async (req: AuthRequest, res: Response): Promise<void> => {
+  try {
+    const page = Math.max(parseInt(req.query.page as string) || 1, 1);
+    const limit = Math.min(parseInt(req.query.limit as string) || 30, 100);
+    const skip = (page - 1) * limit;
+
+    const [items, total] = await Promise.all([
+      Payment.find({ user: req.user!._id })
+        .sort({ createdAt: -1 })
+        .skip(skip)
+        .limit(limit),
+      Payment.countDocuments({ user: req.user!._id }),
+    ]);
+
+    res.status(200).json({
+      success: true,
+      data: {
+        items,
+        pagination: { page, limit, total, pages: Math.ceil(total / limit) },
+      },
+    });
+  } catch (error) {
+    res.status(500).json({ success: false, message: 'Failed to fetch statement' });
+  }
+};
+
+/**
+ * GET /api/v1/payments/wallet/received
+ * Lists driver earning entries with both gross fare and net (after commission).
+ * Pulls from completed Rides where this user is the driver.
+ */
+export const getReceivedAmounts = async (req: AuthRequest, res: Response): Promise<void> => {
+  try {
+    const page = Math.max(parseInt(req.query.page as string) || 1, 1);
+    const limit = Math.min(parseInt(req.query.limit as string) || 30, 100);
+    const skip = (page - 1) * limit;
+
+    const { Ride } = await import('../models/Ride');
+    const [rides, total] = await Promise.all([
+      Ride.find({ driver: req.user!._id, status: 'completed' })
+        .sort({ completedAt: -1, createdAt: -1 })
+        .skip(skip)
+        .limit(limit)
+        .select(
+          'actualFare estimatedFare commission driverEarnings tip completedAt createdAt',
+        ),
+      Ride.countDocuments({ driver: req.user!._id, status: 'completed' }),
+    ]);
+
+    const items = rides.map((r: any) => {
+      const gross =
+        r.actualFare ??
+        r.estimatedFare ??
+        (r.driverEarnings || 0) + (r.commission || 0);
+      return {
+        _id: String(r._id),
+        grossFare: gross,
+        commission: r.commission || 0,
+        netEarnings: r.driverEarnings || 0,
+        tip: r.tip || 0,
+        at: r.completedAt || r.createdAt,
+      };
+    });
+
+    res.status(200).json({
+      success: true,
+      data: {
+        items,
+        pagination: { page, limit, total, pages: Math.ceil(total / limit) },
+      },
+    });
+  } catch (error) {
+    console.error('getReceivedAmounts error:', error);
+    res.status(500).json({ success: false, message: 'Failed to fetch received amounts' });
+  }
+};
+
+/**
+ * POST /api/v1/payments/wallet/cashout
+ * Driver-initiated withdrawal. Debits the wallet immediately and creates a
+ * pending Payment of type 'cashout' that ops team marks as completed once
+ * the actual bank transfer settles.
+ *
+ * Body: { amount: number, method: 'bank' | 'upi', upiId?: string }
+ */
+export const requestCashout = async (req: AuthRequest, res: Response): Promise<void> => {
+  try {
+    const { amount, method = 'bank', upiId } = req.body as {
+      amount?: number;
+      method?: 'bank' | 'upi';
+      upiId?: string;
+    };
+
+    const MIN = 100;
+    const FEE = 5;
+
+    if (!amount || amount < MIN) {
+      res.status(400).json({
+        success: false,
+        message: `Minimum withdrawal amount is ₹${MIN}`,
+      });
+      return;
+    }
+
+    const totalDebit = amount + FEE;
+    const wallet = await Wallet.findOne({ user: req.user!._id });
+    if (!wallet || wallet.balance < totalDebit) {
+      res.status(400).json({
+        success: false,
+        message: 'Insufficient wallet balance (including ₹5 transaction fee)',
+      });
+      return;
+    }
+
+    // Snapshot the destination so it survives later bank-detail edits.
+    const user = await User.findById(req.user!._id);
+    const bank = user?.driverProfile?.bankDetails;
+    const accountLast4 = bank?.accountNumber
+      ? bank.accountNumber.slice(-4)
+      : undefined;
+
+    if (method === 'bank' && !accountLast4) {
+      res.status(400).json({
+        success: false,
+        message: 'Add a bank account before requesting a cashout.',
+      });
+      return;
+    }
+    if (method === 'upi' && !upiId) {
+      res.status(400).json({
+        success: false,
+        message: 'Provide a UPI ID to cash out via UPI.',
+      });
+      return;
+    }
+
+    // Atomic-ish: debit first, then create payment. If payment.create throws
+    // we credit back. Wallet has its own balance >= 0 schema guard.
+    wallet.balance = Math.max(0, wallet.balance - totalDebit);
+    await wallet.save();
+
+    let payment;
+    try {
+      payment = await Payment.create({
+        user: req.user!._id,
+        type: 'cashout',
+        amount,
+        method: method === 'upi' ? 'upi' : 'bank_transfer',
+        status: 'pending',
+        payoutMethod: method,
+        payoutDestination:
+          method === 'bank'
+            ? { bankName: bank?.bankName, accountLast4 }
+            : { upiId },
+        description:
+          method === 'bank'
+            ? `Cashout to ${bank?.bankName || 'bank'} ••••${accountLast4}`
+            : `Cashout to UPI ${upiId}`,
+      });
+    } catch (err) {
+      wallet.balance = wallet.balance + totalDebit;
+      await wallet.save();
+      throw err;
+    }
+
+    // Record the fee as a separate completed line so the statement is honest.
+    if (FEE > 0) {
+      await Payment.create({
+        user: req.user!._id,
+        type: 'commission',
+        amount: FEE,
+        method: 'wallet',
+        status: 'completed',
+        description: 'Cashout transaction fee',
+      });
+    }
+
+    res.status(201).json({
+      success: true,
+      data: {
+        payment,
+        wallet: { balance: wallet.balance, currency: wallet.currency },
+      },
+    });
+  } catch (error) {
+    console.error('requestCashout error:', error);
+    res.status(500).json({ success: false, message: 'Failed to request cashout' });
+  }
 };
 
 // ════════════════════════════════════════════════

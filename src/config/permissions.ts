@@ -42,9 +42,16 @@ export const PERMISSIONS = {
   VIEW_PROMOS: 'view_promos',
   MANAGE_PROMOS: 'manage_promos',
 
+  // Referrals (refer & earn tracking)
+  VIEW_REFERRALS: 'view_referrals',
+
   // OnePass
   VIEW_ONEPASS: 'view_onepass',
   MANAGE_ONEPASS: 'manage_onepass',
+
+  // Subscriptions (flexible plans for drivers / customers)
+  VIEW_SUBSCRIPTIONS: 'view_subscriptions',
+  MANAGE_SUBSCRIPTIONS: 'manage_subscriptions',
 
   // Chat & support
   VIEW_CHATS: 'view_chats',
@@ -74,6 +81,10 @@ export const PERMISSIONS = {
   // Routes (private + scheduled / shuttle rides)
   VIEW_ROUTES: 'view_routes',
   MANAGE_ROUTES: 'manage_routes',
+
+  // FAQs (admin-managed help content for customer + driver apps)
+  VIEW_FAQS: 'view_faqs',
+  MANAGE_FAQS: 'manage_faqs',
 
   // Settings
   VIEW_SETTINGS: 'view_settings',
@@ -109,6 +120,7 @@ export const ROLE_PERMISSIONS: Record<AdminRole, Permission[]> = {
     PERMISSIONS.ASSIGN_TICKETS,
     PERMISSIONS.SEND_NOTIFICATIONS,
     PERMISSIONS.VIEW_PAYMENTS,
+    PERMISSIONS.VIEW_REFERRALS,
   ],
 
   finance: [
@@ -125,8 +137,11 @@ export const ROLE_PERMISSIONS: Record<AdminRole, Permission[]> = {
     PERMISSIONS.MANAGE_INVOICES,
     PERMISSIONS.VIEW_DRIVERS,
     PERMISSIONS.VIEW_PROMOS,
+    PERMISSIONS.VIEW_REFERRALS,
     PERMISSIONS.VIEW_ONEPASS,
     PERMISSIONS.MANAGE_ONEPASS,
+    PERMISSIONS.VIEW_SUBSCRIPTIONS,
+    PERMISSIONS.MANAGE_SUBSCRIPTIONS,
     PERMISSIONS.VIEW_INCENTIVES,
     PERMISSIONS.MANAGE_INCENTIVES,
     PERMISSIONS.PAYOUT_INCENTIVES,
@@ -144,7 +159,9 @@ export const ROLE_PERMISSIONS: Record<AdminRole, Permission[]> = {
     PERMISSIONS.VIEW_PAYMENTS,
     PERMISSIONS.VIEW_SETTLEMENTS,
     PERMISSIONS.VIEW_PROMOS,
+    PERMISSIONS.VIEW_REFERRALS,
     PERMISSIONS.VIEW_ONEPASS,
+    PERMISSIONS.VIEW_SUBSCRIPTIONS,
     PERMISSIONS.VIEW_CHATS,
     PERMISSIONS.VIEW_TICKETS,
     PERMISSIONS.VIEW_SETTINGS,

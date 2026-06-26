@@ -3,13 +3,56 @@
 export interface IPayment extends Document {
   user: mongoose.Types.ObjectId;
   ride?: mongoose.Types.ObjectId;
-  type: 'ride_payment' | 'wallet_topup' | 'tip' | 'refund' | 'subscription' | 'cancellation_fee';
+  /**
+   * Payment kinds:
+   * - ride_payment   : driver earnings (gross fare minus driver-keeps split, but
+   *                    in this codebase we record the net `driverEarnings` here)
+   * - commission     : platform fee taken on a ride (paired with ride_payment)
+   * - wallet_topup   : driver recharges their wallet via Razorpay
+   * - cashout        : driver withdraws balance to bank/UPI
+   * - tip            : rider-paid tip added on top of fare
+   * - refund         : refunded to user (positive sign)
+   * - cancellation_fee, subscription, incentive, bonus : self-explanatory
+   */
+  type:
+    | 'ride_payment'
+    | 'scheduled_booking'
+    | 'commission'
+    | 'wallet_topup'
+    | 'cashout'
+    | 'tip'
+    | 'refund'
+    | 'subscription'
+    | 'cancellation_fee'
+    | 'incentive'
+    | 'bonus';
   amount: number;
   currency: string;
-  method: 'card' | 'cash' | 'wallet';
+  method: 'card' | 'cash' | 'wallet' | 'bank_transfer' | 'upi';
   status: 'pending' | 'completed' | 'failed' | 'refunded';
   razorpayOrderId?: string;
   razorpayPaymentId?: string;
+  /**
+   * For wallet_topup: the amount actually credited to the wallet on success.
+   * Differs from `amount` (the money charged via Razorpay) when an offer adds
+   * a bonus or applies a discount. Crediting code uses `walletCredit ?? amount`
+   * so legacy rows without this field still credit the charged amount.
+   */
+  walletCredit?: number;
+  /** For wallet_topup: the bonus portion of walletCredit, for analytics. */
+  bonusAmount?: number;
+  /** For wallet_topup: the recharge offer this top-up used, if any. */
+  rechargeOffer?: mongoose.Types.ObjectId;
+  /** For subscription (OnePass): which plan key was purchased (weekly/monthly/annual). */
+  subscriptionPlan?: string;
+  /** For cashout: which payout channel was requested. */
+  payoutMethod?: 'bank' | 'upi';
+  /** For cashout: snapshot of the destination so it survives bank-detail edits. */
+  payoutDestination?: {
+    bankName?: string;
+    accountLast4?: string;
+    upiId?: string;
+  };
   description: string;
   createdAt: Date;
   updatedAt: Date;
@@ -21,12 +64,28 @@ const paymentSchema = new Schema<IPayment>(
     ride: { type: Schema.Types.ObjectId, ref: 'Ride' },
     type: {
       type: String,
-      enum: ['ride_payment', 'wallet_topup', 'tip', 'refund', 'subscription', 'cancellation_fee'],
+      enum: [
+        'ride_payment',
+        'scheduled_booking',
+        'commission',
+        'wallet_topup',
+        'cashout',
+        'tip',
+        'refund',
+        'subscription',
+        'cancellation_fee',
+        'incentive',
+        'bonus',
+      ],
       required: true,
     },
     amount: { type: Number, required: true },
     currency: { type: String, default: 'INR' },
-    method: { type: String, enum: ['card', 'cash', 'wallet'], required: true },
+    method: {
+      type: String,
+      enum: ['card', 'cash', 'wallet', 'bank_transfer', 'upi'],
+      required: true,
+    },
     status: {
       type: String,
       enum: ['pending', 'completed', 'failed', 'refunded'],
@@ -34,6 +93,16 @@ const paymentSchema = new Schema<IPayment>(
     },
     razorpayOrderId: String,
     razorpayPaymentId: String,
+    walletCredit: { type: Number },
+    bonusAmount: { type: Number },
+    rechargeOffer: { type: Schema.Types.ObjectId, ref: 'RechargeOffer' },
+    subscriptionPlan: { type: String },
+    payoutMethod: { type: String, enum: ['bank', 'upi'] },
+    payoutDestination: {
+      bankName: String,
+      accountLast4: String,
+      upiId: String,
+    },
     description: { type: String, required: true },
   },
   { timestamps: true }

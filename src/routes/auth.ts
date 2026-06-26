@@ -5,6 +5,8 @@ import {
   refreshToken,
   logout,
   getMe,
+  applyReferral,
+  deleteAccount,
   updateProfile,
   driverSignup,
   adminLogin,
@@ -34,8 +36,10 @@ router.post('/reset-password', resetPassword);
 
 // ── Protected ──
 router.get('/me', authenticate, getMe);
+router.delete('/me', authenticate, deleteAccount);
 router.put('/profile', authenticate, updateProfileValidation, updateProfile);
 router.post('/logout', authenticate, logout);
 router.post('/change-password', authenticate, changePassword);
+router.post('/apply-referral', authenticate, applyReferral);
 
 export default router;

@@ -3,13 +3,21 @@ import mongoose, { Document, Schema } from 'mongoose';
 export interface IRide extends Document {
   customer: mongoose.Types.ObjectId;
   driver?: mongoose.Types.ObjectId;
-  rideType: 'economy' | 'comfort' | 'premium' | 'xl' | 'electric';
+  // Admin-managed VehicleType.code (e.g. 'sedan', 'muv', 'auto',
+  // 'premium-suv'). The legacy fixed enum has been retired — the catalogue
+  // is configurable from the admin panel.
+  rideType: string;
   status:
     | 'searching'
     | 'driver_assigned'
     | 'driver_arriving'
     | 'driver_arrived'
     | 'in_progress'
+    // Trip has physically ended but settlement is outstanding. We sit
+    // here until the customer pays (wallet/Razorpay) OR the driver
+    // confirms cash receipt — only then does the ride transition to
+    // 'completed'.
+    | 'payment_pending'
     | 'completed'
     | 'cancelled';
 
@@ -49,8 +57,17 @@ export interface IRide extends Document {
   paymentStatus: 'pending' | 'completed' | 'refunded' | 'failed';
   promoCode?: string;
 
+  /** Loyalty voucher consumed on this ride (issued by a reward redemption). */
+  loyaltyRedemption?: mongoose.Types.ObjectId;
+  /** ₹ taken off by loyalty (tier discount + redeemed voucher), for transparency. */
+  loyaltyDiscount?: number;
+
   isScheduled: boolean;
   scheduledAt?: Date;
+  returnDeparture?: {
+    time: string;          // 'HH:MM' 24h
+    scheduledFor: Date;    // absolute date+time
+  };
   isPrivate: boolean;
 
   rating?: {
@@ -62,15 +79,42 @@ export interface IRide extends Document {
   };
 
   cancellation?: {
-    cancelledBy: 'customer' | 'driver' | 'system';
+    cancelledBy: 'customer' | 'driver' | 'admin' | 'system';
     reason: string;
     fee: number;
     cancelledAt: Date;
   };
 
+  /**
+   * Dispute resolution record. A ride is *flagged* as disputed dynamically
+   * (low rating or a cancellation fee — see GET /admin/rides/disputed); this
+   * subdocument is written only when an admin resolves it, so the disputes
+   * queue can exclude already-handled cases.
+   */
+  dispute?: {
+    resolved: boolean;
+    resolution?: string;
+    notes?: string;
+    refundAmount?: number;
+    resolvedBy?: mongoose.Types.ObjectId;
+    resolvedAt?: Date;
+  };
+
   route?: {
     encodedPolyline: string;
   };
+
+  /** 4-digit OTP shown to the customer; driver enters it to confirm pickup.
+   *  Cleared (set to undefined) once verification succeeds. */
+  pickupOtp?: string;
+
+  /** Drivers who declined this request before someone else accepted it.
+   *  Capped at last 20 entries to keep documents small. */
+  rejections?: {
+    driver: mongoose.Types.ObjectId;
+    reason?: string;
+    rejectedAt: Date;
+  }[];
 
   startedAt?: Date;
   completedAt?: Date;
@@ -84,8 +128,12 @@ const rideSchema = new Schema<IRide>(
     driver: { type: Schema.Types.ObjectId, ref: 'User' },
     rideType: {
       type: String,
-      enum: ['economy', 'comfort', 'premium', 'xl', 'electric'],
       required: true,
+      // No enum: vehicle types are admin-managed (see VehicleType collection),
+      // so the set of valid codes changes at runtime. A trim + lowercase is
+      // enough to keep stored codes consistent across rides.
+      trim: true,
+      lowercase: true,
     },
     status: {
       type: String,
@@ -95,6 +143,7 @@ const rideSchema = new Schema<IRide>(
         'driver_arriving',
         'driver_arrived',
         'in_progress',
+        'payment_pending',
         'completed',
         'cancelled',
       ],
@@ -140,6 +189,9 @@ const rideSchema = new Schema<IRide>(
       enum: ['card', 'cash', 'wallet'],
       default: 'card',
     },
+    loyaltyRedemption: { type: Schema.Types.ObjectId, ref: 'LoyaltyRedemption' },
+    loyaltyDiscount: { type: Number, default: 0 },
+
     paymentStatus: {
       type: String,
       enum: ['pending', 'completed', 'refunded', 'failed'],
@@ -149,6 +201,16 @@ const rideSchema = new Schema<IRide>(
 
     isScheduled: { type: Boolean, default: false },
     scheduledAt: Date,
+    returnDeparture: {
+      type: new Schema(
+        {
+          time: { type: String, required: true, match: /^([01]\d|2[0-3]):[0-5]\d$/ },
+          scheduledFor: { type: Date, required: true },
+        },
+        { _id: false },
+      ),
+      required: false,
+    },
     isPrivate: { type: Boolean, default: false },
 
     rating: {
@@ -160,11 +222,37 @@ const rideSchema = new Schema<IRide>(
     },
 
     cancellation: {
-      cancelledBy: { type: String, enum: ['customer', 'driver', 'system'] },
+      cancelledBy: { type: String, enum: ['customer', 'driver', 'admin', 'system'] },
       reason: String,
       fee: { type: Number, default: 0 },
       cancelledAt: Date,
     },
+
+    dispute: {
+      resolved: { type: Boolean, default: false },
+      resolution: String,
+      notes: String,
+      refundAmount: { type: Number, default: 0 },
+      resolvedBy: { type: Schema.Types.ObjectId, ref: 'User' },
+      resolvedAt: Date,
+    },
+
+    // 4-digit pickup OTP. Generated at ride creation, shown to the customer
+    // in their tracking screen, entered by the driver to confirm the
+    // correct passenger before starting the trip. Cleared (set to undefined)
+    // once verification succeeds.
+    pickupOtp: { type: String },
+
+    // Drivers who declined this request before someone else accepted it.
+    // Capped at last 20 entries to keep documents small. Used by ops to
+    // spot drivers with high reject rates.
+    rejections: [
+      {
+        driver: { type: Schema.Types.ObjectId, ref: 'User' },
+        reason: String,
+        rejectedAt: { type: Date, default: Date.now },
+      },
+    ],
 
     route: {
       encodedPolyline: String,

@@ -34,6 +34,9 @@ router.get(
           req.query.assignedTo === 'unassigned' ? { $exists: false } : req.query.assignedTo;
       }
       if (req.query.submittedByRole) filter.submittedByRole = req.query.submittedByRole;
+      // Tag filter — used by the "Document Update Requests" admin view to
+      // surface driver-initiated document-change tickets (tag: 'doc-update').
+      if (req.query.tag) filter.tags = req.query.tag;
       if (req.query.q) {
         const q = String(req.query.q).trim();
         if (q.startsWith('TKT-')) filter.ticketNumber = q;
@@ -142,6 +145,18 @@ router.patch(
       const ticket = await SupportTicket.findById(req.params.id);
       if (!ticket) return res.status(404).json({ success: false, message: 'Ticket not found' });
 
+      // Admin-closed tickets are terminal — reject every mutation (status,
+      // priority, assignee, tags, resolution). The customer must open a new
+      // ticket. 'resolved' is the reopenable soft state; admin 'closed' is not.
+      if (ticket.status === 'closed' && ticket.closedByRole === 'admin') {
+        return res.status(409).json({
+          success: false,
+          code: 'TICKET_CLOSED',
+          message:
+            'This ticket was closed by support and can no longer be modified. The customer should create a new ticket.',
+        });
+      }
+
       const { status, priority, assignedTo, tags, resolution } = req.body || {};
       let priorityChanged = false;
 
@@ -154,11 +169,15 @@ router.patch(
       if (status && status !== ticket.status) {
         ticket.status = status;
         if (status === 'resolved') ticket.resolvedAt = new Date();
-        if (status === 'closed') ticket.closedAt = new Date();
+        if (status === 'closed') {
+          ticket.closedAt = new Date();
+          ticket.closedByRole = 'admin';
+        }
         if (status === 'open' && (ticket.closedAt || ticket.resolvedAt)) {
           ticket.reopenCount = (ticket.reopenCount || 0) + 1;
           ticket.closedAt = undefined;
           ticket.resolvedAt = undefined;
+          ticket.closedByRole = undefined;
         }
       }
 
@@ -208,6 +227,15 @@ router.post(
       }
       const ticket = await SupportTicket.findById(req.params.id);
       if (!ticket) return res.status(404).json({ success: false, message: 'Ticket not found' });
+
+      // Can't (re)assign a ticket support has already closed.
+      if (ticket.status === 'closed' && ticket.closedByRole === 'admin') {
+        return res.status(409).json({
+          success: false,
+          code: 'TICKET_CLOSED',
+          message: 'This ticket was closed by support and can no longer be modified.',
+        });
+      }
 
       const { adminId, claim } = req.body || {};
       let target: mongoose.Types.ObjectId | undefined;
@@ -263,6 +291,16 @@ router.post(
       }
       const ticket = await SupportTicket.findById(req.params.id);
       if (!ticket) return res.status(404).json({ success: false, message: 'Ticket not found' });
+
+      // No replies (or internal notes) on a ticket support has closed — posting
+      // one used to silently reopen it by flipping status back to in_progress.
+      if (ticket.status === 'closed' && ticket.closedByRole === 'admin') {
+        return res.status(409).json({
+          success: false,
+          code: 'TICKET_CLOSED',
+          message: 'This ticket was closed by support and can no longer be modified.',
+        });
+      }
 
       const adminId = (req as any).user?._id;
       const isInternal = !!internal;

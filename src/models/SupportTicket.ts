@@ -48,6 +48,13 @@ export interface ISupportTicket extends Document {
   firstResponseAt?: Date;
   resolvedAt?: Date;
   closedAt?: Date;
+  /**
+   * Who moved the ticket into its current `closed` state. Admin-closed
+   * tickets are terminal — they can't be reopened by a customer reply or by
+   * an admin, so the customer has to open a new ticket. A ticket the customer
+   * closed themselves stays reopenable. Cleared whenever a ticket reopens.
+   */
+  closedByRole?: TicketSenderRole;
   reopenCount: number;
   lastUpdatedBy?: Types.ObjectId;
   metadata?: Record<string, any>;
@@ -118,6 +125,7 @@ const supportTicketSchema = new Schema<ISupportTicket>(
     firstResponseAt: { type: Date },
     resolvedAt: { type: Date },
     closedAt: { type: Date },
+    closedByRole: { type: String, enum: ['customer', 'driver', 'admin', 'system'] },
     reopenCount: { type: Number, default: 0 },
     lastUpdatedBy: { type: Schema.Types.ObjectId, ref: 'User' },
     metadata: { type: Schema.Types.Mixed },

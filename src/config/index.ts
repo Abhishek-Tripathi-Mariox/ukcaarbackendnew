@@ -19,6 +19,12 @@ export const config = {
 
   redis: {
     url: process.env.REDIS_URL || 'redis://localhost:6379',
+    // Set REDIS_ENABLED=true on EVERY backend instance to share Socket.IO
+    // rooms + ride-dispatch state across them via Redis. Required whenever
+    // more than one backend process serves the same DB (horizontal scaling,
+    // or a customer-server / driver-server split). Leave unset for a single
+    // instance — the app then uses in-process memory and needs no Redis.
+    enabled: process.env.REDIS_ENABLED === 'true',
   },
 
   google: {
@@ -78,11 +84,29 @@ export const config = {
     },
   },
 
+  // ── Referrals ──
+  // Wallet bonus credited to a user when they apply someone's referral code.
+  // Defaults to 0 (linkage only) so money isn't given away by accident — set
+  // REFERRAL_BONUS to enable. NOTE: crediting the *referrer* is intentionally
+  // not done here; that should be gated on the referee's first completed ride
+  // to limit abuse (a product decision).
+  referral: {
+    bonus: Number(process.env.REFERRAL_BONUS) || 0,
+    currency: 'INR',
+  },
+
   // ── OnePass subscription ──
+  // Server-authoritative plans. The client never sends a price; it picks a
+  // plan key and the backend charges the matching price via Razorpay.
   onePass: {
     price: 99.99,
-    duration: 30, // days
+    duration: 30, // days (legacy default)
     currency: 'INR',
+    plans: {
+      weekly: { label: 'Weekly', price: 49, days: 7 },
+      monthly: { label: 'Monthly', price: 99.99, days: 30 },
+      annual: { label: 'Annual', price: 999, days: 365 },
+    } as Record<string, { label: string; price: number; days: number }>,
   },
 
   // ── Tax / invoicing (India) ──

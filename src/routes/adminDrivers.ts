@@ -11,7 +11,14 @@ import { sendPushToUser } from '../controllers/fcmController';
  * The set of documents every driver must upload before their application
  * can be approved. Keep in sync with the driver app's DriverDetailsScreen.
  */
-const REQUIRED_DRIVER_DOCS = ['licence', 'aadhaar', 'profile-photo'] as const;
+const REQUIRED_DRIVER_DOCS = [
+  'licence',
+  'aadhaar-front',
+  'aadhaar-back',
+  'profile-photo',
+  'vehicle',
+  'insurance',
+] as const;
 
 /**
  * Admin driver management endpoints — extends and (where useful) supersedes
@@ -156,10 +163,17 @@ const approveHandler = async (req: Request, res: Response) => {
       return;
     }
     const docs = candidate.driverProfile?.documents || [];
+    // Legacy drivers (pre front/back split) stored a single combined "aadhaar"
+    // doc. Treat a verified legacy doc as satisfying both aadhaar-front/back so
+    // those drivers can still be approved.
+    const legacyAadhaar = docs.find((d: any) => d.type === 'aadhaar');
     const missing: string[] = [];
     const unverified: string[] = [];
     for (const required of REQUIRED_DRIVER_DOCS) {
-      const found = docs.find((d: any) => d.type === required);
+      let found = docs.find((d: any) => d.type === required);
+      if (!found && (required === 'aadhaar-front' || required === 'aadhaar-back')) {
+        found = legacyAadhaar;
+      }
       if (!found) missing.push(required);
       else if (found.status !== 'verified') unverified.push(required);
     }

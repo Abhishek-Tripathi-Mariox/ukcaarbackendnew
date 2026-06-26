@@ -1,12 +1,31 @@
 import { Response } from 'express';
-import { Chat } from '../models';
+import { Chat, Ride } from '../models';
 import { AuthRequest } from '../middleware/auth';
+
+/**
+ * Returns true if the authenticated user is the customer or assigned driver
+ * of the given ride. Admins are allowed through (they use the admin chat
+ * viewer). Returns false if the ride doesn't exist.
+ */
+async function isRideParticipant(req: AuthRequest, rideId: string): Promise<boolean> {
+  if (req.user?.role === 'admin') return true;
+  const ride = await Ride.findById(rideId).select('customer driver');
+  if (!ride) return false;
+  const uid = req.user!._id.toString();
+  return ride.customer?.toString() === uid || (!!ride.driver && ride.driver.toString() === uid);
+}
 
 /**
  * GET /api/v1/chat/:rideId
  */
 export const getChat = async (req: AuthRequest, res: Response): Promise<void> => {
   try {
+    // Only the ride's participants may read its chat.
+    if (!(await isRideParticipant(req, req.params.rideId))) {
+      res.status(403).json({ success: false, message: 'Not authorized to view this chat' });
+      return;
+    }
+
     let chat = await Chat.findOne({ ride: req.params.rideId })
       .populate('messages.sender', 'firstName lastName avatar');
 
@@ -35,9 +54,14 @@ export const sendMessage = async (req: AuthRequest, res: Response): Promise<void
       return;
     }
 
+    // Only the ride's participants may post into its chat.
+    if (!(await isRideParticipant(req, req.params.rideId))) {
+      res.status(403).json({ success: false, message: 'Not authorized to message in this chat' });
+      return;
+    }
+
     let chat = await Chat.findOne({ ride: req.params.rideId });
     if (!chat) {
-      const { Ride } = await import('../models/Ride');
       const ride = await Ride.findById(req.params.rideId);
       if (!ride) {
         res.status(404).json({ success: false, message: 'Ride not found' });

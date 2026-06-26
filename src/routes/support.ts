@@ -1,6 +1,6 @@
 import { Router, Response } from 'express';
 import mongoose from 'mongoose';
-import { SupportTicket } from '../models';
+import { SupportTicket, FAQ } from '../models';
 import { authenticate, AuthRequest } from '../middleware/auth';
 import {
   generateTicketNumber,
@@ -11,6 +11,26 @@ import { emitToUser } from '../socket';
 
 const router = Router();
 router.use(authenticate);
+
+/**
+ * GET /api/v1/support/faqs
+ * Active FAQ entries for the caller's app. A driver sees 'driver' + 'both'
+ * entries; everyone else (customers) sees 'user' + 'both'. Sorted by the
+ * admin-defined `order`. Returns only the fields the apps render.
+ */
+router.get('/faqs', async (req: AuthRequest, res: Response) => {
+  try {
+    const audiences =
+      req.user?.role === 'driver' ? ['driver', 'both'] : ['user', 'both'];
+    const faqs = await FAQ.find({ isActive: true, audience: { $in: audiences } })
+      .select('question answer order')
+      .sort({ order: 1, createdAt: 1 });
+    res.json({ success: true, data: { faqs } });
+  } catch (err) {
+    console.error('[Support] faqs error:', err);
+    res.status(500).json({ success: false, message: 'Failed to load FAQs' });
+  }
+});
 
 /**
  * Returns a sanitized ticket view for end-users:
@@ -46,6 +66,8 @@ router.post('/tickets', async (req: AuthRequest, res: Response) => {
       relatedRide,
       relatedPayment,
       attachments,
+      tags,
+      metadata,
     } = req.body || {};
 
     if (!subject || !description) {
@@ -69,6 +91,10 @@ router.post('/tickets', async (req: AuthRequest, res: Response) => {
       relatedRide: relatedRide && mongoose.isValidObjectId(relatedRide) ? relatedRide : undefined,
       relatedPayment:
         relatedPayment && mongoose.isValidObjectId(relatedPayment) ? relatedPayment : undefined,
+      // Tags let admins filter for special-purpose tickets like
+      // 'doc-update' (driver-requested document changes).
+      tags: Array.isArray(tags) ? tags.map((t: any) => String(t).trim()).filter(Boolean) : [],
+      metadata: metadata && typeof metadata === 'object' ? metadata : undefined,
       slaDueAt: computeSlaDue(priority),
       messages: [
         {
@@ -171,10 +197,22 @@ router.post('/tickets/:id/messages', async (req: AuthRequest, res: Response) => 
       return res.status(404).json({ success: false, message: 'Ticket not found' });
     }
     if (ticket.status === 'closed') {
+      // A ticket closed by support is terminal — replying can't reopen it.
+      // The customer has to start a fresh ticket. Tickets the customer closed
+      // themselves stay reopenable, so only block the admin-closed case.
+      if (ticket.closedByRole === 'admin') {
+        return res.status(409).json({
+          success: false,
+          code: 'TICKET_CLOSED',
+          message:
+            'This ticket has been closed by support and can no longer be reopened. Please create a new ticket.',
+        });
+      }
       ticket.status = 'open';
       ticket.reopenCount = (ticket.reopenCount || 0) + 1;
       ticket.closedAt = undefined;
       ticket.resolvedAt = undefined;
+      ticket.closedByRole = undefined;
     } else if (ticket.status === 'pending_user') {
       ticket.status = 'open';
     }
@@ -220,6 +258,9 @@ router.post('/tickets/:id/close', async (req: AuthRequest, res: Response) => {
     if (!ticket) return res.status(404).json({ success: false, message: 'Ticket not found' });
     ticket.status = 'closed';
     ticket.closedAt = new Date();
+    // Tag this as a self-close so the customer can still reopen it later by
+    // replying — only admin-closed tickets are locked.
+    ticket.closedByRole = user.role as 'customer' | 'driver';
     ticket.lastUpdatedBy = user._id;
     await ticket.save();
     res.json({ success: true, data: sanitizeForUser(ticket) });

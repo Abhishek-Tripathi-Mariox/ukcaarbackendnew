@@ -49,11 +49,14 @@ export const config = {
   },
 
   s3: {
-    bucketName: process.env.S3_BUCKET_NAME || 'ukcaar',
+    // NOTE: the real bucket is 'ukcar' (one 'a') in ap-south-1. The old
+    // defaults ('ukcaar', 'eu-west-2') pointed at a bucket we don't own and
+    // made every upload fail with AccessDenied when env vars were unset.
+    bucketName: process.env.S3_BUCKET_NAME || 'ukcar',
     accessKeyId: process.env.S3_ACCESS_KEY_ID || '',
     secretAccessKey: process.env.S3_SECRET_ACCESS_KEY || '',
-    region: process.env.S3_REGION || 'eu-west-2',
-    baseUrl: process.env.S3_BASE_URL || '',
+    region: process.env.S3_REGION || 'ap-south-1',
+    baseUrl: process.env.S3_BASE_URL || 'https://ukcar.s3.ap-south-1.amazonaws.com',
   },
 
   rateLimit: {

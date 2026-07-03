@@ -60,12 +60,15 @@ export const uploadFile = async (req: AuthRequest, res: Response): Promise<void>
       : `${type || 'general'}/${req.user!._id}/${uuidv4()}${ext}`;
 
     // Upload to S3
+    // NOTE: no ACL set — the bucket has Object Ownership = "Bucket owner
+    // enforced" (ACLs disabled), so PutObject with an ACL fails with
+    // AccessControlListNotSupported. Public read is granted via the bucket
+    // policy instead, so uploaded objects are still publicly accessible.
     const command = new PutObjectCommand({
       Bucket: config.s3.bucketName,
       Key: key,
       Body: file.buffer,
       ContentType: file.mimetype,
-      ACL: 'public-read',
     });
 
     await s3Client.send(command);
@@ -165,11 +168,13 @@ export const getPresignedUrl = async (req: AuthRequest, res: Response): Promise<
     const folder = type || 'general';
     const key = `${folder}/${req.user!._id}/${uuidv4()}${ext}`;
 
+    // No ACL — bucket has ACLs disabled (see uploadFile). If the presigned
+    // PUT included an x-amz-acl header the client's upload would 400, so the
+    // client must not send one either.
     const command = new PutObjectCommand({
       Bucket: config.s3.bucketName,
       Key: key,
       ContentType: contentType,
-      ACL: 'public-read',
     });
 
     const presignedUrl = await getSignedUrl(s3Client, command, { expiresIn: 300 }); // 5 minutes

@@ -62,14 +62,16 @@ export const sendOtp = async (req: Request, res: Response): Promise<void> => {
     // In production, send via Twilio/SMS provider
     // await twilioClient.messages.create({ to: fullPhone, body: `Your UKCAAR code is: ${otp}` });
 
-    const isTestMode = config.env === 'development' || process.env.TEST_MODE === 'true';
+    // No SMS provider yet (client-testing phase). The universal test OTP
+    // (config.auth.testOtp, e.g. "115566") is what testers actually use to log
+    // in; we also surface the generated per-user OTP in the response while the
+    // test flag is on, for convenience.
     console.log(`📱 OTP for ${fullPhone}: ${otp}`);
 
     res.status(200).json({
       success: true,
       message: 'OTP sent successfully',
-      // Return OTP in dev/test mode for testing
-      ...(isTestMode && { otp }),
+      ...(config.auth.allowTestOtp && { otp }),
     });
   } catch (error) {
     console.error('sendOtp error:', error);
@@ -98,10 +100,11 @@ export const verifyOtp = async (req: Request, res: Response): Promise<void> => {
       return;
     }
 
-    // Dev/Test bypass: accept "115566" in development or when TEST_MODE is enabled
-    const isTestMode = config.env === 'development' || process.env.TEST_MODE === 'true';
+    // Universal test OTP (client-testing phase — no SMS provider). Accepts
+    // config.auth.testOtp for any user while config.auth.allowTestOtp is on.
+    // See config/index.ts for the security warning.
     const isValidOtp =
-      (isTestMode && otp === '115566') ||
+      (config.auth.allowTestOtp && otp === config.auth.testOtp) ||
       (user.otp === otp && user.otpExpiry && user.otpExpiry > new Date());
 
     if (!isValidOtp) {
@@ -557,7 +560,6 @@ export const forgotPassword = async (req: Request, res: Response): Promise<void>
     }
 
     const user = await User.findOne({ email });
-    const isTestMode = config.env === 'development' || process.env.TEST_MODE === 'true';
 
     if (user && user.role === 'admin' && user.isActive) {
       const otp = generateOTP();
@@ -572,8 +574,8 @@ export const forgotPassword = async (req: Request, res: Response): Promise<void>
     res.status(200).json({
       success: true,
       message: 'If an account exists for that email, a reset code has been sent.',
-      // Dev convenience: surface the universal test OTP so the panel can pre-fill / show it.
-      ...(isTestMode && { devOtp: '115566' }),
+      // Surface the universal test OTP so the panel can pre-fill / show it.
+      ...(config.auth.allowTestOtp && { devOtp: config.auth.testOtp }),
     });
   } catch (error) {
     console.error('forgotPassword error:', error);
@@ -584,7 +586,7 @@ export const forgotPassword = async (req: Request, res: Response): Promise<void>
 /**
  * POST /api/v1/auth/reset-password
  * Verify OTP and set a new password.
- * Accepts the universal dev OTP "115566" in development / TEST_MODE.
+ * Accepts the universal test OTP (config.auth.testOtp) while config.auth.allowTestOtp is on.
  */
 export const resetPassword = async (req: Request, res: Response): Promise<void> => {
   try {
@@ -606,9 +608,8 @@ export const resetPassword = async (req: Request, res: Response): Promise<void> 
       return;
     }
 
-    const isTestMode = config.env === 'development' || process.env.TEST_MODE === 'true';
     const otpMatches =
-      (isTestMode && otp === '115566') ||
+      (config.auth.allowTestOtp && otp === config.auth.testOtp) ||
       (user.otp === otp && user.otpExpiry && user.otpExpiry > new Date());
 
     if (!otpMatches) {

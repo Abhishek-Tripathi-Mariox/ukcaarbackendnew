@@ -153,9 +153,14 @@ const userSchema = new Schema<IUser>(
   {
     firstName: { type: String, default: '', trim: true },
     lastName: { type: String, default: '', trim: true },
+    // NOTE: no `default: ''`. The email index is `unique + sparse`, and a
+    // sparse index only skips documents where the field is ABSENT — not
+    // empty-string. A `default: ''` gave every phone-only signup email:'' ,
+    // so the second such user collided (E11000) and User.save() threw, making
+    // send-otp return 500. Leaving email unset keeps phone-only users out of
+    // the index entirely.
     email: {
       type: String,
-      default: '',
       lowercase: true,
       trim: true,
     },

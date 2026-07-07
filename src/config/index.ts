@@ -43,6 +43,17 @@ export const config = {
     phoneNumber: process.env.TWILIO_PHONE_NUMBER || '',
   },
 
+  // ── OTP / auth (CLIENT-TESTING PHASE) ──
+  // We have no SMS provider yet, so a universal OTP lets testers log in for
+  // any phone number. SECURITY WARNING: while this is on, ANYONE who knows
+  // `testOtp` can log into ANY account. This is a deliberate backdoor for the
+  // pre-launch testing build. Set ALLOW_TEST_OTP=false (and ideally remove
+  // this) before opening the apps to the public.
+  auth: {
+    allowTestOtp: process.env.ALLOW_TEST_OTP !== 'false', // ON by default for now
+    testOtp: process.env.TEST_OTP || '115566',
+  },
+
   upload: {
     maxFileSize: parseInt(process.env.MAX_FILE_SIZE || '5242880', 10),
     dir: process.env.UPLOAD_DIR || 'uploads',

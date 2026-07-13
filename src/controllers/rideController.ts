@@ -1260,6 +1260,135 @@ export const rejectRide = async (req: AuthRequest, res: Response): Promise<void>
 };
 
 /**
+ * GET /api/v1/rides/available  (Driver)
+ *
+ * Returns the ride requests currently offered to this driver — the pull-based
+ * complement to the socket `ride:new-request` push. Reading shared DB state
+ * (not per-instance socket rooms) means it works on a multi-instance / split
+ * deployment where `emitToUser` can't cross processes, so the driver app can
+ * populate its in-app "Incoming Requests" list (and pop the modal) even when
+ * the socket push never arrives — the same reason FCM keeps working.
+ *
+ * Mirrors `dispatchToNearbyDrivers` selection exactly: online driver, matching
+ * tier (serviceType) + vehicleTypeCode (or unset), not busy, within 7 km of a
+ * still-`searching` ride's pickup, and not already rejected by this driver.
+ * The payload shape is identical to the socket `ridePayload`.
+ */
+export const getAvailableRides = async (req: AuthRequest, res: Response): Promise<void> => {
+  try {
+    const driver = await User.findById(req.user!._id).select(
+      '_id role driverProfile.isOnline driverProfile.serviceType ' +
+        'driverProfile.vehicleTypeCode driverProfile.currentLocation',
+    );
+    if (!driver || driver.role !== 'driver') {
+      res.status(403).json({ success: false, message: 'Drivers only' });
+      return;
+    }
+
+    const dp: any = driver.driverProfile;
+    const loc = dp?.currentLocation;
+    // Same gate as dispatch: only online drivers with a known location are
+    // offered rides. Silently return an empty list otherwise.
+    if (
+      !dp?.isOnline ||
+      !loc ||
+      typeof loc.lat !== 'number' ||
+      typeof loc.lng !== 'number'
+    ) {
+      res.status(200).json({ success: true, data: { rides: [] } });
+      return;
+    }
+
+    // A driver already on a ride must not be offered new ones.
+    const busy = await Ride.exists({
+      driver: driver._id,
+      status: {
+        $in: ['driver_assigned', 'driver_arriving', 'driver_arrived', 'in_progress'],
+      },
+    });
+    if (busy) {
+      res.status(200).json({ success: true, data: { rides: [] } });
+      return;
+    }
+
+    const serviceType = dp.serviceType;
+    // Pending rides still looking for a driver, excluding ones this driver
+    // has already rejected. Newest first; cap the scan cheaply.
+    const searching = await Ride.find({
+      status: 'searching',
+      'rejections.driver': { $ne: driver._id },
+    })
+      .populate('customer', 'firstName lastName')
+      .sort({ createdAt: -1 })
+      .limit(50);
+
+    const { VehicleType } = await import('../models');
+    const RADIUS_KM = 7;
+    const KM_PER_DEG_LAT = 111;
+    const kmPerDegLng = 111 * Math.cos((loc.lat * Math.PI) / 180) || 111;
+
+    const rides: any[] = [];
+    for (const ride of searching) {
+      const pickup: any = ride.pickup;
+      const dropoff: any = ride.dropoff;
+      if (!pickup || typeof pickup.lat !== 'number' || typeof pickup.lng !== 'number') {
+        continue;
+      }
+
+      // Distance filter — same flat-earth approximation the dispatch uses.
+      const dLatKm = (loc.lat - pickup.lat) * KM_PER_DEG_LAT;
+      const dLngKm = (loc.lng - pickup.lng) * kmPerDegLng;
+      const distKm = Math.sqrt(dLatKm * dLatKm + dLngKm * dLngKm);
+      if (distKm > RADIUS_KM) continue;
+
+      // Resolve the ride's tier the same way dispatch does.
+      const requestedType = ride.rideType
+        ? await VehicleType.findOne({
+            code: String(ride.rideType).toLowerCase(),
+          }).select('code tier')
+        : null;
+      const expectedTier =
+        (requestedType as any)?.tier ?? (ride.isPrivate ? 'private' : 'instant');
+      if (serviceType !== expectedTier) continue;
+
+      // vehicleTypeCode narrowing: only exclude a driver whose set code
+      // mismatches (unset code = eligible), exactly like the dispatch $or.
+      if (
+        (requestedType as any)?.code &&
+        dp.vehicleTypeCode &&
+        dp.vehicleTypeCode !== (requestedType as any).code
+      ) {
+        continue;
+      }
+
+      const c: any = ride.customer || {};
+      const customerName =
+        [c.firstName, c.lastName].filter(Boolean).join(' ') || 'Passenger';
+
+      rides.push({
+        rideId: String(ride._id),
+        variant: expectedTier,
+        passengerName: customerName,
+        pickup: pickup.address,
+        drop: dropoff?.address ?? '',
+        pickupLat: pickup.lat,
+        pickupLng: pickup.lng,
+        dropLat: dropoff?.lat,
+        dropLng: dropoff?.lng,
+        fare: ride.estimatedFare,
+        distance: ride.estimatedDistance,
+        duration: ride.estimatedDuration,
+      });
+    }
+
+    res.status(200).json({ success: true, data: { rides } });
+  } catch (error) {
+    console.error('getAvailableRides error:', error);
+    res.status(500).json({ success: false, message: 'Failed to fetch available rides' });
+  }
+};
+
+/**
  * PUT /api/v1/rides/:id/verify-otp  (Driver)
  *
  * Driver enters the 4-digit OTP the passenger reads aloud. We compare it

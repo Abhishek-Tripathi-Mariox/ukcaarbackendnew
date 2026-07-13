@@ -22,6 +22,60 @@ const googleKey = (): string => {
   return k;
 };
 
+// ── In-memory caches ──────────────────────────────────────────────────────
+// The autocomplete endpoint was doing an N+1 on every keystroke: one Places
+// Autocomplete call, then a Place Details call for EACH of up to 8 predictions
+// — 9 round-trips to Google per character typed. As the user types
+// "a" → "ai" → "air" → "airp", the top predictions (and thus their place_ids)
+// overlap almost entirely, so the same details were re-fetched every keystroke.
+//
+// Two small TTL caches collapse that: place_ids resolve to details once (they
+// almost never change → long TTL, high hit-rate across successive keystrokes),
+// and whole-query responses are memoised briefly so a backspace/retype or two
+// riders searching the same thing don't hit Google at all. Bounded in size so
+// a busy server can't leak memory. Process-local (no Redis needed) — a cache
+// miss just falls through to the live fetch, so correctness never depends on it.
+interface CacheEntry<T> {
+  value: T;
+  exp: number;
+}
+const DETAILS_TTL_MS = 60 * 60 * 1000; // place details are effectively static
+const AC_TTL_MS = 2 * 60 * 1000; // whole-query results: short, for repeats
+const DETAILS_CACHE_MAX = 5000;
+const AC_CACHE_MAX = 2000;
+
+const placeDetailsCache = new Map<string, CacheEntry<any>>();
+const autocompleteCache = new Map<string, CacheEntry<any[]>>();
+
+const cacheGet = <T>(cache: Map<string, CacheEntry<T>>, key: string): T | undefined => {
+  const hit = cache.get(key);
+  if (!hit) return undefined;
+  if (hit.exp < Date.now()) {
+    cache.delete(key);
+    return undefined;
+  }
+  // Refresh LRU recency: re-insert so it moves to the end of the Map.
+  cache.delete(key);
+  cache.set(key, hit);
+  return hit.value;
+};
+
+const cacheSet = <T>(
+  cache: Map<string, CacheEntry<T>>,
+  key: string,
+  value: T,
+  ttlMs: number,
+  max: number,
+): void => {
+  cache.set(key, { value, exp: Date.now() + ttlMs });
+  // Evict oldest entries (Map preserves insertion order) once over budget.
+  while (cache.size > max) {
+    const oldest = cache.keys().next().value;
+    if (oldest === undefined) break;
+    cache.delete(oldest);
+  }
+};
+
 const router = Router();
 router.use(authenticate);
 
@@ -116,6 +170,23 @@ router.get('/autocomplete', async (req: Request, res: Response) => {
       Math.max(0.5, parseFloat(String(req.query.radius ?? '10')) || 10);
     const hasBias = Number.isFinite(biasLat) && Number.isFinite(biasLng);
 
+    // Whole-query cache. Key on the normalized query + country + limit +
+    // rounded bias (2 dp ≈ 1 km grid so nearby riders share entries). A hit
+    // returns the already-filtered result set with zero upstream calls.
+    const acKey = JSON.stringify({
+      q: q.toLowerCase(),
+      countryCodes,
+      limit,
+      lat: hasBias ? biasLat.toFixed(2) : '',
+      lng: hasBias ? biasLng.toFixed(2) : '',
+      r: radiusKm,
+    });
+    const cachedAc = cacheGet(autocompleteCache, acKey);
+    if (cachedAc) {
+      res.status(200).json({ success: true, data: { results: cachedAc } });
+      return;
+    }
+
     // ── Provider 1: Google Places (preferred when key present) ──────────
     const key = googleKey();
     if (key) {
@@ -146,16 +217,31 @@ router.get('/autocomplete', async (req: Request, res: Response) => {
           const results = await Promise.all(
             preds.map(async (p: any) => {
               try {
-                const dUrl = new URL(`${GOOGLE_PLACES_BASE}/details/json`);
-                dUrl.searchParams.set('place_id', p.place_id);
-                dUrl.searchParams.set(
-                  'fields',
-                  'geometry/location,formatted_address,address_components,name'
-                );
-                dUrl.searchParams.set('key', key);
-                const dResp = await fetch(dUrl.toString());
-                const dJson: any = await dResp.json();
-                const r = dJson?.result;
+                // Resolve the prediction's details from cache when we can —
+                // successive keystrokes share the same place_ids, so this is
+                // where most of the latency win comes from.
+                let r = cacheGet(placeDetailsCache, String(p.place_id));
+                if (!r) {
+                  const dUrl = new URL(`${GOOGLE_PLACES_BASE}/details/json`);
+                  dUrl.searchParams.set('place_id', p.place_id);
+                  dUrl.searchParams.set(
+                    'fields',
+                    'geometry/location,formatted_address,address_components,name'
+                  );
+                  dUrl.searchParams.set('key', key);
+                  const dResp = await fetch(dUrl.toString());
+                  const dJson: any = await dResp.json();
+                  r = dJson?.result;
+                  if (r?.geometry?.location) {
+                    cacheSet(
+                      placeDetailsCache,
+                      String(p.place_id),
+                      r,
+                      DETAILS_TTL_MS,
+                      DETAILS_CACHE_MAX,
+                    );
+                  }
+                }
                 if (!r?.geometry?.location) return null;
                 const comps: any[] = r.address_components ?? [];
                 const compOf = (type: string) =>
@@ -208,6 +294,7 @@ router.get('/autocomplete', async (req: Request, res: Response) => {
               )
             : cleaned;
           const bounded = withinRadius.length > 0 ? withinRadius : cleaned;
+          cacheSet(autocompleteCache, acKey, bounded, AC_TTL_MS, AC_CACHE_MAX);
           res.status(200).json({
             success: true,
             data: { results: bounded },
@@ -306,6 +393,7 @@ router.get('/autocomplete', async (req: Request, res: Response) => {
         )
       : results;
 
+    cacheSet(autocompleteCache, acKey, boundedNominatim, AC_TTL_MS, AC_CACHE_MAX);
     res.status(200).json({ success: true, data: { results: boundedNominatim } });
   } catch (error) {
     console.error('[geo] autocomplete error:', error);

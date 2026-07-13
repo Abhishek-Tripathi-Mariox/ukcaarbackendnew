@@ -5,6 +5,7 @@ import {
   getRide,
   getRides,
   getActiveRide,
+  getAvailableRides,
   acceptRide,
   rejectRide,
   verifyRideOtp,
@@ -28,6 +29,8 @@ router.get('/', getRides);
 // /active must be declared before /:id so the literal path wins over the
 // param matcher; otherwise express treats "active" as an ObjectId.
 router.get('/active', getActiveRide);
+// Driver pull-based ride feed — must also precede /:id (literal over param).
+router.get('/available', authorize('driver'), getAvailableRides);
 router.get('/:id', getRide);
 router.put('/:id/cancel', cancelRide);
 router.put('/:id/rate', rateRideValidation, rateRide);

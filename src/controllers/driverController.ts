@@ -1,6 +1,6 @@
 import { Response } from 'express';
 import mongoose from 'mongoose';
-import { User, Ride, Payment } from '../models';
+import { User, Ride, Payment, Route } from '../models';
 import { AuthRequest } from '../middleware/auth';
 import { config } from '../config';
 import { createOrder } from './paymentController';
@@ -450,6 +450,26 @@ export const getMyDashboard = async (req: AuthRequest, res: Response): Promise<v
       ]),
     ]);
 
+    const scheduledRoutes = await Route.find({
+      isActive: true,
+      type: 'scheduled',
+      $or: [
+        { 'registeredDrivers.driver': driverId },
+        { driver: driverId },
+      ],
+    }).lean();
+
+    const routesForDriver =
+      scheduledRoutes.length > 0 || user?.driverProfile?.serviceType !== 'scheduled'
+        ? scheduledRoutes
+        : await Route.find({ isActive: true, type: 'scheduled' }).lean();
+
+    let upcomingScheduled = 0;
+    for (const r of routesForDriver) {
+      const deps = r.schedule?.departures?.length || 0;
+      upcomingScheduled += deps * 7;
+    }
+
     const counts = rideCounts[0] || { total: 0, today: 0, upcoming: 0 };
     const totalEarnings = earnings[0]?.total ?? 0;
 
@@ -465,9 +485,9 @@ export const getMyDashboard = async (req: AuthRequest, res: Response): Promise<v
         },
         stats: {
           totalEarnings,
-          totalServices: counts.total,
-          upcomingServices: counts.upcoming,
-          todayServices: counts.today,
+          totalServices: counts.total + upcomingScheduled,
+          upcomingServices: counts.upcoming + upcomingScheduled,
+          todayServices: counts.today + (routesForDriver.length > 0 ? routesForDriver.reduce((acc, r) => acc + (r.schedule?.departures?.length || 0), 0) : 0),
         },
       },
     });

@@ -1021,24 +1021,15 @@ export const getRides = async (req: AuthRequest, res: Response): Promise<void> =
     // here and project them to a Ride-shaped row with that flag set.
     // Only relevant for customers — drivers see their bookings via the
     // route registration UI in the driver app.
-    const includeBookings =
-      req.user?.role === 'customer' &&
-      // If the admin/UI explicitly filtered to a Ride-only status
-      // (driver_assigned, in_progress, etc.) we skip the projection;
-      // bookings only ever sit in reserved/cancelled.
-      (!req.query.status ||
-        req.query.status === 'cancelled' ||
-        req.query.status === 'searching' ||
-        req.query.status === 'driver_assigned');
+    const includeBookings = req.user?.role !== 'admin';
 
     const bookingFilter: Record<string, any> = {};
-    if (includeBookings) {
-      bookingFilter.customer = req.user!._id;
-      // Surface active (reserved) AND completed bookings so the rider sees a
-      // finished trip move to their Completed tab. Only include cancelled when
-      // the rider explicitly filters cancelled.
+    if (includeBookings && req.user?._id) {
+      bookingFilter.customer = req.user._id;
       if (req.query.status === 'cancelled') {
         bookingFilter.status = 'cancelled';
+      } else if (req.query.status === 'completed') {
+        bookingFilter.status = 'completed';
       } else {
         bookingFilter.status = { $in: ['reserved', 'completed', 'cancelled'] };
       }
@@ -1072,8 +1063,8 @@ export const getRides = async (req: AuthRequest, res: Response): Promise<void> =
     // ride flow.
     const projected = (bookings as any[]).map((b: any) => {
       const stops = b.route?.stops ?? [];
-      const first = stops[0];
-      const last = stops[stops.length - 1];
+      const first = stops[b.pickupIndex ?? 0] ?? stops[0];
+      const last = stops[b.dropIndex ?? stops.length - 1] ?? stops[stops.length - 1];
       const slot = b.route?.schedule?.departures?.[b.departureIndex];
       return {
         _id: `sched_${b._id}`,

@@ -146,6 +146,41 @@ router.get('/', async (req: AuthRequest, res: Response) => {
         existingKeys.add(key);
       }
     }
+
+    const myRoutes = await Route.find({
+      isActive: true,
+      type: 'scheduled',
+      $or: [
+        { 'registeredDrivers.driver': new mongoose.Types.ObjectId(driverId) },
+        { driver: new mongoose.Types.ObjectId(driverId) },
+      ],
+    }).lean();
+
+    const routesToCheck =
+      myRoutes.length > 0
+        ? myRoutes
+        : await Route.find({ isActive: true, type: 'scheduled' }).lean();
+
+    for (const r of routesToCheck) {
+      const departures = r.schedule?.departures || [];
+      const daysOfWeek = r.schedule?.daysOfWeek || [0, 1, 2, 3, 4, 5, 6];
+      for (let dayOffset = 0; dayOffset <= 7; dayOffset++) {
+        const d = new Date();
+        d.setDate(d.getDate() + dayOffset);
+        const dayNum = d.getDay();
+        if (daysOfWeek.length > 0 && !daysOfWeek.includes(dayNum)) continue;
+        const dateStr = d.toISOString().slice(0, 10);
+        for (let depIdx = 0; depIdx < departures.length; depIdx++) {
+          const key = makeKey(r._id, depIdx, dateStr);
+          if (!existingKeys.has(key)) {
+            groups.push({
+              _id: { route: r._id, departureIndex: depIdx, departureDate: dateStr },
+            });
+            existingKeys.add(key);
+          }
+        }
+      }
+    }
     const isPast = (g: any): boolean => {
       const key = makeKey(g._id.route, g._id.departureIndex, g._id.departureDate);
       const status = (jMap.get(key) as IDriverJourney | undefined)?.status;

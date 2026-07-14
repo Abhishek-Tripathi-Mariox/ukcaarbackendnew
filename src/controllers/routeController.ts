@@ -26,20 +26,10 @@ export const listScheduledRoutes = async (
   res: Response,
 ): Promise<void> => {
   try {
-    const onlyWithDriver = req.query.hasApprovedDriver === 'true';
-
     const filter: Record<string, unknown> = {
       type: 'scheduled',
       isActive: true,
     };
-    if (onlyWithDriver) {
-      // Find routes where the embedded array contains at least one approved
-      // driver. Mongo's `$elemMatch` on the same subdoc handles this without
-      // a $lookup, since registeredDrivers is embedded.
-      filter.registeredDrivers = {
-        $elemMatch: { status: 'approved' },
-      };
-    }
 
     const routes = await Route.find(filter)
       .select('-assignedUsers -__v')
@@ -209,14 +199,6 @@ export const listScheduledRoutes = async (
     // the admin didn't PIN-tag, sits within PICKUP_NEARBY_METERS of the
     // rider's pickup. Gated on pickup info so callers that pass none (e.g. the
     // Scheduled-tab driver-count aggregate) still get the full list.
-    const PICKUP_NEARBY_METERS = 20000; // ~20 km — same town / adjacent area
-    if (hasPickup || pickupPincode) {
-      ranked = ranked.filter(
-        (x) =>
-          x.matchedByPincode ||
-          (x.pickupMeters !== null && x.pickupMeters <= PICKUP_NEARBY_METERS),
-      );
-    }
     if (hasPickup || pickupPincode) {
       ranked.sort((a, b) => {
         // PIN match beats raw distance — surface "obviously in this town"

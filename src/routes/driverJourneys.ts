@@ -75,7 +75,7 @@ async function shapeJourney(
     driver: driverId,
     departureIndex: index,
     departureDate: date,
-    status: 'reserved',
+    status: { $in: ['reserved', 'completed'] },
   }).lean();
 
   const passengerCount = bookings.reduce((n, b) => n + (b.seats?.length ?? 0), 0);
@@ -116,7 +116,7 @@ router.get('/', async (req: AuthRequest, res: Response) => {
 
     // Distinct (route, departureIndex, departureDate) groups this driver has bookings for.
     const groups = await ScheduledBooking.aggregate([
-      { $match: { driver: new mongoose.Types.ObjectId(driverId), status: 'reserved' } },
+      { $match: { driver: new mongoose.Types.ObjectId(driverId), status: { $in: ['reserved', 'completed'] } } },
       {
         $group: {
           _id: { route: '$route', departureIndex: '$departureIndex', departureDate: '$departureDate' },
@@ -133,6 +133,19 @@ router.get('/', async (req: AuthRequest, res: Response) => {
     const jMap = new Map(
       journeys.map((j) => [makeKey(j.route, j.departureIndex, j.departureDate), j]),
     );
+
+    const existingKeys = new Set(
+      groups.map((g) => makeKey(g._id.route, g._id.departureIndex, g._id.departureDate))
+    );
+    for (const j of journeys) {
+      const key = makeKey(j.route, j.departureIndex, j.departureDate);
+      if (!existingKeys.has(key)) {
+        groups.push({
+          _id: { route: j.route, departureIndex: j.departureIndex, departureDate: j.departureDate },
+        });
+        existingKeys.add(key);
+      }
+    }
     const isPast = (g: any): boolean => {
       const key = makeKey(g._id.route, g._id.departureIndex, g._id.departureDate);
       const status = (jMap.get(key) as IDriverJourney | undefined)?.status;
@@ -223,7 +236,7 @@ router.get('/:key/passengers', async (req: AuthRequest, res: Response) => {
       driver: req.user!._id,
       departureIndex: parsed.index,
       departureDate: parsed.date,
-      status: 'reserved',
+      status: { $in: ['reserved', 'completed'] },
     })
       .populate('customer', 'firstName lastName phone')
       .lean();

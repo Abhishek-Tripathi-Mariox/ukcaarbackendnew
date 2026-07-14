@@ -1040,7 +1040,7 @@ export const getRides = async (req: AuthRequest, res: Response): Promise<void> =
       if (req.query.status === 'cancelled') {
         bookingFilter.status = 'cancelled';
       } else {
-        bookingFilter.status = { $in: ['reserved', 'completed'] };
+        bookingFilter.status = { $in: ['reserved', 'completed', 'cancelled'] };
       }
     }
 

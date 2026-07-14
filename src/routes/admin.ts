@@ -2657,21 +2657,24 @@ router.get('/promos/:id/usage', async (req: Request, res: Response) => {
  */
 router.post('/promos', requirePermission(PERMISSIONS.MANAGE_PROMOS), auditLog({ action: 'promo.create', resourceType: 'PromoCode' }), async (req: Request, res: Response) => {
   try {
-    const { code, type, value, maxUses, minFare, maxDiscount, expiresAt, description } = req.body;
+    const { code, type, value, maxUses, minFare, minRideAmount, maxDiscount, expiresAt, description } = req.body;
 
-    if (!code || !type || !value || !expiresAt) {
-      res.status(400).json({ success: false, message: 'Code, type, value, and expiresAt are required' });
+    if (!code || !type || value === undefined) {
+      res.status(400).json({ success: false, message: 'Code, type, and value are required' });
       return;
     }
+
+    const defaultExpiry = new Date(Date.now() + 365 * 24 * 60 * 60 * 1000);
 
     const promo = await PromoCode.create({
       code: code.toUpperCase().replace(/\s/g, ''),
       type,
-      value,
-      maxUses: maxUses || 100,
-      minFare: minFare || 0,
-      maxDiscount: maxDiscount || 50,
-      expiresAt: new Date(expiresAt),
+      value: Number(value) || 0,
+      maxUses: Number(maxUses) || 100,
+      minFare: Number(minFare ?? minRideAmount) || 0,
+      maxDiscount: Number(maxDiscount) || 50,
+      expiresAt: expiresAt ? new Date(expiresAt) : defaultExpiry,
+      description: description || '',
       isActive: true,
     });
 

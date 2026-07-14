@@ -225,8 +225,8 @@ router.post(
 const rejectHandler = async (req: Request, res: Response) => {
   try {
     const { reason } = req.body || {};
-    if (!reason) {
-      res.status(400).json({ success: false, message: 'reason is required' });
+    if (!reason || typeof reason !== 'string' || !reason.trim()) {
+      res.status(400).json({ success: false, message: 'Rejection reason is required' });
       return;
     }
     const driver = await User.findOneAndUpdate(

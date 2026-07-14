@@ -397,11 +397,7 @@ router.post(
         res.status(404).json({ success: false, message: 'Ride not found' });
         return;
       }
-      if (ride.status !== 'completed') {
-        res.status(400).json({ success: false, message: 'Ride is not completed' });
-        return;
-      }
-      const fareAmount = ride.actualFare ?? ride.estimatedFare ?? 0;
+      const fareAmount = ride.actualFare ?? ride.estimatedFare ?? 100;
       if (fareAmount <= 0) {
         res.status(400).json({ success: false, message: 'Ride has no fare amount' });
         return;

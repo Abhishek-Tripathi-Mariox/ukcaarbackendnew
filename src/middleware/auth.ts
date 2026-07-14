@@ -14,13 +14,19 @@ export const authenticate = async (
   next: NextFunction
 ): Promise<void> => {
   try {
+    let token: string | undefined;
     const authHeader = req.headers.authorization;
-    if (!authHeader?.startsWith('Bearer ')) {
+    if (authHeader?.startsWith('Bearer ')) {
+      token = authHeader.split(' ')[1];
+    } else if (typeof req.query.token === 'string' && req.query.token) {
+      token = req.query.token;
+    }
+
+    if (!token) {
       res.status(401).json({ success: false, message: 'No token provided' });
       return;
     }
 
-    const token = authHeader.split(' ')[1];
     const decoded = jwt.verify(token, config.jwt.secret) as { userId: string; role: string };
 
     const user = await User.findById(decoded.userId);

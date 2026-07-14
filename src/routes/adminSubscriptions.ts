@@ -101,6 +101,9 @@ router.post(
       const doc: Record<string, any> = {};
       for (const f of PLAN_FIELDS) if (f in body) doc[f] = body[f];
       doc.name = String(body.name).trim();
+      doc.price = Math.max(0, Number(doc.price) || 0);
+      doc.commissionRate = Math.min(100, Math.max(0, Number(doc.commissionRate) || 0));
+      doc.validityDays = Math.max(1, Number(doc.validityDays) || 30);
       if (body.rideLimit === undefined) doc.rideLimit = null;
       if (!Array.isArray(doc.benefits)) doc.benefits = [];
 
@@ -127,6 +130,9 @@ router.patch(
       const updates: Record<string, any> = {};
       for (const f of PLAN_FIELDS) if (f in body) updates[f] = body[f];
       if ('name' in updates) updates.name = String(updates.name).trim();
+      if ('price' in updates) updates.price = Math.max(0, Number(updates.price) || 0);
+      if ('commissionRate' in updates) updates.commissionRate = Math.min(100, Math.max(0, Number(updates.commissionRate) || 0));
+      if ('validityDays' in updates) updates.validityDays = Math.max(1, Number(updates.validityDays) || 30);
 
       const plan = await SubscriptionPlan.findByIdAndUpdate(req.params.id, updates, {
         new: true,

@@ -1005,10 +1005,12 @@ export const getRides = async (req: AuthRequest, res: Response): Promise<void> =
     const skip = (page - 1) * limit;
 
     const filter: Record<string, any> = {};
-    if (req.user?.role === 'customer') {
-      filter.customer = req.user._id;
-    } else if (req.user?.role === 'driver') {
-      filter.driver = req.user._id;
+    if (req.user?.role !== 'admin' && req.user?._id) {
+      if (req.user.role === 'driver' && req.query.asDriver === 'true') {
+        filter.driver = req.user._id;
+      } else {
+        filter.$or = [{ customer: req.user._id }, { driver: req.user._id }];
+      }
     }
 
     if (req.query.status) {
@@ -1025,7 +1027,7 @@ export const getRides = async (req: AuthRequest, res: Response): Promise<void> =
 
     const bookingFilter: Record<string, any> = {};
     if (includeBookings && req.user?._id) {
-      bookingFilter.customer = req.user._id;
+      bookingFilter.$or = [{ customer: req.user._id }, { driver: req.user._id }];
       if (req.query.status === 'cancelled') {
         bookingFilter.status = 'cancelled';
       } else if (req.query.status === 'completed') {

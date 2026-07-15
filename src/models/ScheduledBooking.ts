@@ -39,11 +39,20 @@ export interface IScheduledBooking extends Document {
   customer: Types.ObjectId;
   status: 'reserved' | 'cancelled' | 'completed';
   totalAmount: number;
+  /** How the rider paid. 'wallet' bookings are auto-refunded to the wallet on
+   *  cancel; 'razorpay' refunds are handled by support/admin out of band.
+   *  Absent on legacy rows created before server-side wallet debits existed. */
+  paymentMethod?: 'wallet' | 'razorpay';
   /** Subset of `seats` the driver has boarded on the trip (per-seat check-in). */
   boardedSeats?: number[];
   /** Subset of `seats` the driver marked no-show (rider didn't turn up). These
    *  are excluded from the driver's settlement; any refund is admin-driven. */
   noShowSeats?: number[];
+  /** Subset of `seats` the driver dropped off EARLY (before the booked stop),
+   *  at the rider's request. The seat stays boarded (the rider paid and rode),
+   *  so this does NOT affect settlement — it's an operational record so admin/
+   *  history can see the early drop. */
+  droppedSeats?: number[];
   /** First time any seat on this booking boarded. */
   boardedAt?: Date;
   /** Who cancelled the seat and why. Populated on cancel so admin/customer
@@ -94,8 +103,10 @@ const scheduledBookingSchema = new Schema<IScheduledBooking>(
       index: true,
     },
     totalAmount: { type: Number, default: 0, min: 0 },
+    paymentMethod: { type: String, enum: ['wallet', 'razorpay'] },
     boardedSeats: { type: [Number], default: [] },
     noShowSeats: { type: [Number], default: [] },
+    droppedSeats: { type: [Number], default: [] },
     boardedAt: { type: Date },
     cancellation: {
       cancelledBy: { type: String, enum: ['customer', 'driver', 'admin', 'system'] },

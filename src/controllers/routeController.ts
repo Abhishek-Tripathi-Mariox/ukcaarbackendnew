@@ -756,8 +756,10 @@ export const bookRouteSeats = async (
 ): Promise<void> => {
   try {
     const { id } = req.params;
-    const { departureDate, departureIndex, seats, totalAmount, driverId, passengers } =
-      req.body ?? {};
+    const {
+      departureDate, departureIndex, seats, totalAmount, driverId, passengers,
+      paymentMethod,
+    } = req.body ?? {};
 
     if (!driverId || typeof driverId !== 'string') {
       res.status(400).json({ success: false, message: 'driverId (vehicle) is required' });
@@ -862,22 +864,101 @@ export const bookRouteSeats = async (
           .filter((p: any) => p.name)
       : [];
 
-    const booking = await ScheduledBooking.create({
-      route: id,
-      departureDate,
-      departureIndex,
-      driver: driverId,
-      seats: seatList,
-      passengers: paxList,
-      customer: req.user!._id,
-      status: 'reserved',
-      totalAmount: Number(totalAmount) || 0,
-    });
+    // Server-authoritative price — NEVER trust the client's `totalAmount`,
+    // which let a tampered client reserve any number of seats for ₹1 (and
+    // poisoned driver-journey settlement, since gross is derived from it).
+    // Priced from the route's configured per-seat price. NOTE: routes that use
+    // per-segment `fareFromPrevious` pricing are charged the flat seatPrice
+    // here — threading boarding/dropping indices through for exact segment
+    // pricing is a tracked follow-up; this closes the under-pricing exploit.
+    const seatPrice = Number(route.schedule?.seatPrice) || 0;
+    const amount =
+      seatPrice > 0 ? seatList.length * seatPrice : Number(totalAmount) || 0;
+
+    // ── Wallet payment ──
+    // When the rider pays from their UKCAAR wallet, the debit MUST happen
+    // here, server-side. Previously the app only subtracted the amount from
+    // its local Redux copy and no Wallet write ever occurred — the balance
+    // "snapped back" on the next fetch and the booking was effectively free.
+    // Razorpay bookings are unaffected (verified before this call).
+    let walletBalanceAfter: number | undefined;
+    if (paymentMethod === 'wallet') {
+      if (!(amount > 0)) {
+        res.status(400).json({ success: false, message: 'Booking amount unavailable' });
+        return;
+      }
+      const { Wallet } = await import('../models');
+      // Atomic conditional decrement — only succeeds if balance >= amount,
+      // so two concurrent bookings can't both spend the same rupees.
+      const debited = await Wallet.findOneAndUpdate(
+        { user: req.user!._id, balance: { $gte: amount } },
+        { $inc: { balance: -amount } },
+        { new: true },
+      );
+      if (!debited) {
+        const current = await Wallet.findOne({ user: req.user!._id }).select('balance').lean();
+        res.status(400).json({
+          success: false,
+          message: 'Insufficient wallet balance',
+          data: { walletBalance: current?.balance ?? 0, required: amount },
+        });
+        return;
+      }
+      walletBalanceAfter = debited.balance;
+    }
+
+    let booking;
+    try {
+      booking = await ScheduledBooking.create({
+        route: id,
+        departureDate,
+        departureIndex,
+        driver: driverId,
+        seats: seatList,
+        passengers: paxList,
+        customer: req.user!._id,
+        status: 'reserved',
+        totalAmount: amount,
+        // Recorded so cancellation knows whether to auto-refund the wallet.
+        paymentMethod: paymentMethod === 'wallet' ? 'wallet' : 'razorpay',
+      });
+    } catch (createErr) {
+      // Booking failed after we took the money — refund the debit so the
+      // rider is never charged for a reservation that doesn't exist.
+      if (paymentMethod === 'wallet') {
+        const { Wallet } = await import('../models');
+        await Wallet.findOneAndUpdate(
+          { user: req.user!._id },
+          { $inc: { balance: amount } },
+        ).catch(() => {});
+      }
+      throw createErr;
+    }
+
+    // Wallet statement row (best-effort — the money movement above is the
+    // source of truth; a missing row only affects the statement display).
+    if (paymentMethod === 'wallet') {
+      try {
+        const { Payment } = await import('../models');
+        await Payment.create({
+          user: req.user!._id,
+          type: 'scheduled_booking',
+          amount,
+          method: 'wallet',
+          status: 'completed',
+          description: `Scheduled seat booking: ₹${amount} (${seatList.length} seat${seatList.length === 1 ? '' : 's'})`,
+        });
+      } catch (payErr) {
+        console.warn('bookRouteSeats: statement row failed:', payErr);
+      }
+    }
 
     res.status(201).json({
       success: true,
       message: 'Seats reserved',
-      data: { booking },
+      // walletBalance present only for wallet payments — the app should set
+      // its local balance from this instead of doing its own subtraction.
+      data: { booking, ...(walletBalanceAfter !== undefined && { walletBalance: walletBalanceAfter }) },
     });
   } catch (error) {
     console.error('bookRouteSeats error:', error);
@@ -918,13 +999,58 @@ export const cancelRouteBooking = async (
       return;
     }
 
+    // Record who cancelled and why so admin/customer history shows the same
+    // "cancelled by + reason" detail that instant-Ride records carry. This is
+    // a customer-initiated endpoint (ownership checked above), so the actor is
+    // the customer; the reason is optional from the client.
+    const reason =
+      typeof req.body?.reason === 'string' && req.body.reason.trim()
+        ? req.body.reason.trim()
+        : 'Cancelled by customer';
+
     booking.status = 'cancelled';
+    booking.cancellation = {
+      cancelledBy: 'customer',
+      reason,
+      cancelledAt: new Date(),
+    };
     await booking.save();
+
+    // Wallet-paid bookings are debited server-side at reservation, so the
+    // cancel must give the money back. Razorpay refunds stay manual (support/
+    // admin) — same as instant rides. Refund AFTER the status flip so a crash
+    // can only under-refund (support-recoverable), never leave a cancelled=no
+    // + refunded=yes combination that hands out free money.
+    let walletBalanceAfter: number | undefined;
+    if (booking.paymentMethod === 'wallet' && booking.totalAmount > 0) {
+      const { Wallet, Payment } = await import('../models');
+      const refunded = await Wallet.findOneAndUpdate(
+        { user: booking.customer },
+        { $inc: { balance: booking.totalAmount } },
+        { new: true, upsert: true },
+      );
+      walletBalanceAfter = refunded.balance;
+      try {
+        await Payment.create({
+          user: booking.customer,
+          type: 'refund',
+          amount: booking.totalAmount,
+          method: 'wallet',
+          status: 'completed',
+          description: `Refund: cancelled scheduled booking (${booking.seats.length} seat${booking.seats.length === 1 ? '' : 's'})`,
+        });
+      } catch (payErr) {
+        console.warn('cancelRouteBooking: refund statement row failed:', payErr);
+      }
+    }
 
     res.status(200).json({
       success: true,
       message: 'Booking cancelled',
-      data: { booking },
+      data: {
+        booking,
+        ...(walletBalanceAfter !== undefined && { walletBalance: walletBalanceAfter }),
+      },
     });
   } catch (error) {
     console.error('cancelRouteBooking error:', error);

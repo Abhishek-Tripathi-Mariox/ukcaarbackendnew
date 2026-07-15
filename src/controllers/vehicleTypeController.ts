@@ -158,6 +158,9 @@ export const listNearbyVehicleTypes = async (
         perKmFare: t.perKmFare,
         perMinFare: t.perMinFare,
         minFare: t.minFare,
+        // Admin-configured seat capacity (undefined until set → app falls
+        // back to its code heuristic).
+        seats: t.seats,
       };
       if (t.tier === 'private') grouped.private.push(entry);
       else grouped.instant.push(entry);

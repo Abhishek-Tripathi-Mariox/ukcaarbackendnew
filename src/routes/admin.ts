@@ -534,7 +534,12 @@ router.put('/users/:id', requirePermission(PERMISSIONS.MANAGE_USERS), auditLog({
 router.put('/users/:id/status', requirePermission(PERMISSIONS.MANAGE_USERS), auditLog({ action: 'user.update_status', resourceType: 'User' }), async (req: Request, res: Response) => {
   try {
     const { isActive } = req.body;
-    const user = await User.findByIdAndUpdate(req.params.id, { isActive }, { new: true });
+    // On suspension, also revoke the refresh token so any live session dies
+    // as soon as its short-lived access token expires — otherwise the user
+    // keeps a working session until they happen to log out.
+    const update: Record<string, any> = { isActive };
+    if (isActive === false) update.refreshToken = null;
+    const user = await User.findByIdAndUpdate(req.params.id, update, { new: true });
     if (!user) {
       res.status(404).json({ success: false, message: 'User not found' });
       return;
@@ -558,7 +563,12 @@ router.put('/users/:id/status', requirePermission(PERMISSIONS.MANAGE_USERS), aud
  */
 router.delete('/users/:id', requirePermission(PERMISSIONS.MANAGE_USERS), auditLog({ action: 'user.delete', resourceType: 'User' }), async (req: Request, res: Response) => {
   try {
-    const user = await User.findByIdAndUpdate(req.params.id, { isActive: false }, { new: true });
+    // refreshToken: null — kill any live session along with the deactivation.
+    const user = await User.findByIdAndUpdate(
+      req.params.id,
+      { isActive: false, refreshToken: null },
+      { new: true },
+    );
     if (!user) {
       res.status(404).json({ success: false, message: 'User not found' });
       return;
@@ -1881,6 +1891,32 @@ router.put('/rides/scheduled/:bookingId/cancel', requirePermission(PERMISSIONS.M
     };
     await booking.save();
 
+    // Refund wallet-paid bookings, mirroring the customer-facing cancel. Admin
+    // cancels previously flipped status + freed seats but never refunded, so a
+    // wallet-paying rider silently lost the fare when support cancelled.
+    let walletBalanceAfter: number | undefined;
+    if (booking.paymentMethod === 'wallet' && booking.totalAmount > 0) {
+      const { Wallet, Payment } = await import('../models');
+      const refunded = await Wallet.findOneAndUpdate(
+        { user: booking.customer },
+        { $inc: { balance: booking.totalAmount } },
+        { new: true, upsert: true },
+      );
+      walletBalanceAfter = refunded.balance;
+      try {
+        await Payment.create({
+          user: booking.customer,
+          type: 'refund',
+          amount: booking.totalAmount,
+          method: 'wallet',
+          status: 'completed',
+          description: `Refund: admin-cancelled scheduled booking (${booking.seats.length} seat${booking.seats.length === 1 ? '' : 's'})`,
+        });
+      } catch (payErr) {
+        console.warn('admin scheduled cancel: refund statement row failed:', payErr);
+      }
+    }
+
     emitToUser(booking.customer.toString(), 'booking:cancelled', {
       bookingId: String(booking._id),
       reason,
@@ -1888,7 +1924,11 @@ router.put('/rides/scheduled/:bookingId/cancel', requirePermission(PERMISSIONS.M
       message: `Your scheduled seat has been cancelled by support. ${reason || ''}`.trim(),
     });
 
-    res.status(200).json({ success: true, data: { booking }, message: 'Booking cancelled' });
+    res.status(200).json({
+      success: true,
+      data: { booking, ...(walletBalanceAfter !== undefined && { walletBalance: walletBalanceAfter }) },
+      message: 'Booking cancelled',
+    });
   } catch (error) {
     res.status(500).json({ success: false, message: 'Cancellation failed' });
   }

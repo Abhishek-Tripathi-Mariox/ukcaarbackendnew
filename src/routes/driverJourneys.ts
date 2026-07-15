@@ -12,7 +12,7 @@ import {
 import { authenticate, authorize, AuthRequest } from '../middleware/auth';
 import { config } from '../config';
 import { emitToUser } from '../socket';
-import { istDateStr } from '../utils/date';
+import { istDateStr, istWeekday, istDateStrPlusDays } from '../utils/date';
 
 const router = Router();
 router.use(authenticate);
@@ -156,20 +156,23 @@ router.get('/', async (req: AuthRequest, res: Response) => {
       ],
     }).lean();
 
-    const routesToCheck =
-      myRoutes.length > 0
-        ? myRoutes
-        : await Route.find({ isActive: true, type: 'scheduled' }).lean();
+    // Only generate placeholder journeys for routes this driver is actually
+    // registered on. The previous fallback to EVERY active scheduled route
+    // meant a driver with no route registration saw journeys for all routes.
+    const routesToCheck = myRoutes;
 
+    const now = new Date();
     for (const r of routesToCheck) {
       const departures = r.schedule?.departures || [];
       const daysOfWeek = r.schedule?.daysOfWeek || [0, 1, 2, 3, 4, 5, 6];
       for (let dayOffset = 0; dayOffset <= 7; dayOffset++) {
-        const d = new Date();
-        d.setDate(d.getDate() + dayOffset);
-        const dayNum = d.getDay();
+        const instant = new Date(now.getTime() + dayOffset * 24 * 60 * 60 * 1000);
+        // IST weekday + IST date — the route's daysOfWeek and the booking dates
+        // are both IST-calendar values. Using server-local getDay()/UTC
+        // toISOString() shifted everything a day during IST 00:00–05:30.
+        const dayNum = istWeekday(instant);
         if (daysOfWeek.length > 0 && !daysOfWeek.includes(dayNum)) continue;
-        const dateStr = d.toISOString().slice(0, 10);
+        const dateStr = istDateStrPlusDays(dayOffset, now);
         for (let depIdx = 0; depIdx < departures.length; depIdx++) {
           const key = makeKey(r._id, depIdx, dateStr);
           if (!existingKeys.has(key)) {
@@ -486,6 +489,88 @@ async function noShowSeats(
   };
 }
 
+/** Record an EARLY DROP for seat(s) on a booking — the rider asked to get off
+ *  before their booked stop. Unlike no-show, the seat STAYS boarded (they paid
+ *  and rode), so settlement is unaffected; we only log it and notify the rider. */
+async function earlyDropSeats(
+  parsed: { routeId: string; index: number; date: string },
+  driverId: any,
+  bookingId: string,
+  seats?: number[],
+): Promise<{ ok: boolean; message?: string; passenger?: any }> {
+  if (!bookingId || !mongoose.isValidObjectId(bookingId)) {
+    return { ok: false, message: 'Invalid booking' };
+  }
+  const booking = await ScheduledBooking.findOne({
+    _id: bookingId,
+    route: parsed.routeId,
+    driver: driverId,
+    departureIndex: parsed.index,
+    departureDate: parsed.date,
+    status: 'reserved',
+  }).populate('customer', 'firstName lastName phone');
+  if (!booking) return { ok: false, message: 'Booking is not valid for this journey' };
+
+  // Only boarded seats can be dropped early. Clamp to the booking's own seats.
+  const boarded = new Set(booking.boardedSeats ?? []);
+  const target = (seats && seats.length ? seats : booking.seats)
+    .filter((s) => booking.seats.includes(s) && boarded.has(s));
+  if (target.length === 0) {
+    return { ok: false, message: 'That seat has not boarded yet' };
+  }
+  const set = new Set(booking.droppedSeats ?? []);
+  target.forEach((s) => set.add(s));
+  booking.droppedSeats = [...set].sort((a, b) => a - b);
+  await booking.save();
+
+  // Tell the rider their early drop was recorded.
+  try {
+    emitToUser(String(booking.customer && (booking.customer as any)._id ? (booking.customer as any)._id : booking.customer), 'scheduled:dropped', {
+      bookingId: String(booking._id),
+      seats: target,
+    });
+  } catch {
+    /* best-effort */
+  }
+
+  const cust: any = booking.customer;
+  return {
+    ok: true,
+    passenger: {
+      bookingId: String(booking._id),
+      name: [cust?.firstName, cust?.lastName].filter(Boolean).join(' ') || 'Passenger',
+      seats: booking.seats,
+      droppedSeats: booking.droppedSeats,
+    },
+  };
+}
+
+/**
+ * POST /api/v1/drivers/journeys/:key/drop
+ * Early drop: the rider asked to get off before their booked stop. Body:
+ * { bookingId, seats? }. The seat stays boarded (still earns) — this only logs
+ * the early drop and notifies the rider. Does NOT end the journey.
+ */
+router.post('/:key/drop', async (req: AuthRequest, res: Response) => {
+  try {
+    const parsed = parseKey(req.params.key);
+    if (!parsed) {
+      res.status(400).json({ success: false, message: 'Invalid journey' });
+      return;
+    }
+    const { bookingId, seats } = req.body || {};
+    const result = await earlyDropSeats(parsed, req.user!._id, bookingId, seats);
+    if (!result.ok) {
+      res.status(400).json({ success: false, message: result.message });
+      return;
+    }
+    res.json({ success: true, data: { passenger: result.passenger } });
+  } catch (err) {
+    console.error('[Journey drop] error:', err);
+    res.status(500).json({ success: false, message: 'Early drop failed' });
+  }
+});
+
 /**
  * POST /api/v1/drivers/journeys/:key/no-show
  * Mark a rider's seat(s) as no-show. Body: { bookingId, seats? }. Excluded from
@@ -645,10 +730,19 @@ router.post('/:key/complete', async (req: AuthRequest, res: Response) => {
     const commissionRate = settings?.commissionRate ?? config.ride.commissionRate ?? 0.2;
     const earnings = Math.round(gross * (1 - commissionRate) * 100) / 100;
 
-    journey.status = 'completed';
-    journey.completedAt = new Date();
-    journey.earnings = earnings;
-    await journey.save();
+    // Atomic completion claim — only the first concurrent /complete wins, so
+    // the wallet credit + booking finalization below run exactly once. The
+    // previous read-then-check-then-save let two concurrent completes both pass
+    // the `status === 'completed'` guard above and both credit the wallet.
+    const claimed = await DriverJourney.findOneAndUpdate(
+      { _id: journey._id, status: { $ne: 'completed' } },
+      { $set: { status: 'completed', completedAt: new Date(), earnings } },
+      { new: true },
+    );
+    if (!claimed) {
+      res.json({ success: true, data: { earnings: journey.earnings, alreadyCompleted: true } });
+      return;
+    }
 
     // Finalize the trip's bookings so the RIDER sees them as completed (not
     // stuck as an active/upcoming reservation). Notify each customer.

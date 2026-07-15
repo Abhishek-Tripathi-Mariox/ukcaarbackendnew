@@ -27,3 +27,10 @@ export function istMinutesOfDay(d: Date = new Date()): number {
 export function istDateStrPlusDays(days: number, d: Date = new Date()): string {
   return istDateStr(new Date(d.getTime() + days * 24 * 60 * 60 * 1000));
 }
+
+/** Day of week (0=Sun … 6=Sat) for the given instant, evaluated in IST.
+ *  Use instead of `Date.getDay()` (server-local) when matching against a
+ *  route's `daysOfWeek`, which is an IST-calendar concept. */
+export function istWeekday(d: Date = new Date()): number {
+  return new Date(d.getTime() + IST_OFFSET_MS).getUTCDay();
+}

@@ -299,7 +299,8 @@ export const getMyRatings = async (req: AuthRequest, res: Response): Promise<voi
       driver: driverId,
       'rating.customerToDriver': { $gt: 0 },
     })
-      .select('rating completedAt createdAt')
+      .select('rating completedAt createdAt customer')
+      .populate('customer', 'firstName lastName avatar')
       .sort({ completedAt: -1, createdAt: -1 })
       .limit(300)
       .lean();
@@ -310,16 +311,27 @@ export const getMyRatings = async (req: AuthRequest, res: Response): Promise<voi
       ? Math.round((scores.reduce((a, b) => a + b, 0) / totalRides) * 10) / 10
       : 0;
 
-    // Recent text comments.
+    // Recent text comments, enriched with the reviewer's name/avatar/date so
+    // the driver dashboard's Reviews card can render real rows (name • date •
+    // stars • text) instead of Figma placeholder people.
     const comments = rated
       .filter((r) => r.rating?.customerComment)
       .slice(0, 10)
-      .map((r, i) => ({
-        id: String((r as any)._id ?? i),
-        stars: r.rating!.customerToDriver as number,
-        text: r.rating!.customerComment as string,
-        source: 'Rider',
-      }));
+      .map((r, i) => {
+        const c: any = (r as any).customer;
+        const reviewerName = c
+          ? [c.firstName, c.lastName].filter(Boolean).join(' ') || 'Rider'
+          : 'Rider';
+        return {
+          id: String((r as any)._id ?? i),
+          stars: r.rating!.customerToDriver as number,
+          text: r.rating!.customerComment as string,
+          source: 'Rider',
+          reviewerName,
+          reviewerAvatar: c?.avatar ?? null,
+          date: ((r as any).completedAt || (r as any).createdAt) ?? null,
+        };
+      });
 
     // Last-7-days trend: average rating per day (0 when no ratings that day).
     const dayMs = 24 * 60 * 60 * 1000;
@@ -516,7 +528,6 @@ export const getMyEarnings = async (req: AuthRequest, res: Response): Promise<vo
     const driverId = new mongoose.Types.ObjectId(req.user!._id);
     const user = await User.findById(driverId).select('driverProfile.commissionRate');
     const commissionPct = user?.driverProfile?.commissionRate ?? 20;
-    const fuelPct = 12;
 
     const now = new Date();
     const startOfThisMonth = new Date(now.getFullYear(), now.getMonth(), 1);
@@ -612,9 +623,20 @@ export const getMyEarnings = async (req: AuthRequest, res: Response): Promise<vo
       return { label, value: hit?.total ?? 0 };
     });
 
-    const platformFee = Math.round((totalEarned * commissionPct) / 100);
-    const fuelAllowance = Math.round((totalEarned * fuelPct) / 100);
-    const netEarnings = totalEarned - platformFee + fuelAllowance;
+    // The driver's `ride_payment` rows already store NET earnings (fare −
+    // commission + tip) — the same amount credited to their wallet. So
+    // `totalEarned` above IS take-home. The previous code treated it as gross
+    // and subtracted commission a SECOND time, then added a fabricated 12%
+    // "fuel allowance" — numbers that never reconciled with the wallet.
+    // Derive the real breakdown from the actual commission rows instead.
+    const commissionAgg = await Payment.aggregate([
+      { $match: { user: driverId, type: 'commission', status: 'completed' } },
+      { $group: { _id: null, total: { $sum: '$amount' } } },
+    ]);
+    const platformFee = Math.round((commissionAgg[0]?.total ?? 0) * 100) / 100;
+    const netEarnings = totalEarned; // already net take-home (matches wallet)
+    const grossEarnings = Math.round((netEarnings + platformFee) * 100) / 100;
+    const fuelAllowance = 0; // removed — was a fabricated inflation of earnings
 
     res.status(200).json({
       success: true,
@@ -626,12 +648,14 @@ export const getMyEarnings = async (req: AuthRequest, res: Response): Promise<vo
         },
         trend,
         breakdown: {
-          totalEarned,
+          // totalEarned is GROSS (what riders paid) so Gross − Fee = Net
+          // reconciles; netEarnings is the wallet-matching take-home.
+          totalEarned: grossEarnings,
           platformFee,
           fuelAllowance,
           netEarnings,
           commissionPct,
-          fuelPct,
+          fuelPct: 0,
         },
       },
     });

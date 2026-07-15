@@ -261,16 +261,36 @@ async function dispatchToNearbyDrivers(ride: any): Promise<void> {
     role: 'driver',
     isActive: true,
     'driverProfile.isOnline': true,
-    'driverProfile.serviceType': expectedTier,
   };
-  if (requestedType?.code) {
-    baseFilter.$or = [
-      { 'driverProfile.vehicleTypeCode': requestedType.code },
-      { 'driverProfile.vehicleTypeCode': { $exists: false } },
-      { 'driverProfile.vehicleTypeCode': null },
-      { 'driverProfile.vehicleTypeCode': '' },
-    ];
+  const and: any[] = [];
+  // serviceType partition. A driver with NO serviceType set (legacy account,
+  // or one that skipped the step) is treated as 'instant' so they still get
+  // instant dispatches instead of being silently excluded from everything —
+  // same class of fix as the vehicleTypeCode allowance below. They never match
+  // the premium 'private' tier, and 'scheduled' drivers still never match.
+  if (expectedTier === 'instant') {
+    and.push({
+      $or: [
+        { 'driverProfile.serviceType': 'instant' },
+        { 'driverProfile.serviceType': { $exists: false } },
+        { 'driverProfile.serviceType': null },
+        { 'driverProfile.serviceType': '' },
+      ],
+    });
+  } else {
+    and.push({ 'driverProfile.serviceType': expectedTier });
   }
+  if (requestedType?.code) {
+    and.push({
+      $or: [
+        { 'driverProfile.vehicleTypeCode': requestedType.code },
+        { 'driverProfile.vehicleTypeCode': { $exists: false } },
+        { 'driverProfile.vehicleTypeCode': null },
+        { 'driverProfile.vehicleTypeCode': '' },
+      ],
+    });
+  }
+  if (and.length) baseFilter.$and = and;
   const candidates = await User.find(baseFilter).select(
     '_id driverProfile.currentLocation',
   );
@@ -441,22 +461,57 @@ export async function finalizeRideSettlement(
   paymentMethod: 'wallet' | 'card' | 'cash',
 ): Promise<any | null> {
   const { Ride } = await import('../models');
-  const ride: any = await Ride.findById(rideId);
-  if (!ride) return null;
-  if (ride.status === 'completed') return ride; // already settled
-  if (ride.status !== 'payment_pending') return ride;
+  const existing: any = await Ride.findById(rideId);
+  if (!existing) return null;
+  if (existing.status === 'completed') return existing; // already settled
+  if (existing.status !== 'payment_pending') return existing;
 
-  const isOnePass = false; // driver context not available here; default rate
+  // Honor OnePass: a driver with an active OnePass subscription pays the
+  // reduced commission rate. This was hardcoded false ("driver context not
+  // available here"), so OnePass drivers were over-charged commission on
+  // every ride even though they'd paid for the lower rate.
+  let isOnePass = false;
+  if (existing.driver) {
+    const drv = await User.findById(existing.driver).select(
+      'driverProfile.isOnePass driverProfile.onePassExpiry',
+    );
+    const dp: any = (drv as any)?.driverProfile;
+    isOnePass =
+      !!dp?.isOnePass && !!dp?.onePassExpiry && new Date(dp.onePassExpiry) > new Date();
+  }
   const rideSettings = await getRideSettings();
   const commissionRate = isOnePass
     ? rideSettings.onePassCommissionRate
     : rideSettings.commissionRate;
-  ride.commission = Math.round((ride.actualFare ?? 0) * commissionRate * 100) / 100;
-  ride.driverEarnings =
-    Math.round(((ride.actualFare ?? 0) - ride.commission + (ride.tip ?? 0)) * 100) / 100;
-  ride.paymentStatus = 'completed';
-  ride.paymentMethod = paymentMethod;
-  ride.status = 'completed';
+  const commission = Math.round((existing.actualFare ?? 0) * commissionRate * 100) / 100;
+  const driverEarnings =
+    Math.round(((existing.actualFare ?? 0) - commission + (existing.tip ?? 0)) * 100) / 100;
+
+  // Atomic settlement claim: only the first caller flips payment_pending →
+  // completed. The Razorpay webhook and the client's verify-payment call land
+  // milliseconds apart and previously both read `payment_pending` and both ran
+  // the driver wallet credit + stat increments (double settlement). The
+  // conditional filter makes the loser find no matching document.
+  const ride: any = await Ride.findOneAndUpdate(
+    { _id: rideId, status: 'payment_pending' },
+    {
+      $set: {
+        status: 'completed',
+        paymentStatus: 'completed',
+        paymentMethod,
+        commission,
+        driverEarnings,
+      },
+    },
+    { new: true },
+  );
+  if (!ride) {
+    // Lost the race — another path already settled this ride. Return the
+    // now-current document without re-running any side effects.
+    return await Ride.findById(rideId);
+  }
+
+  // ── Side effects below run exactly once (guarded by the atomic claim) ──
 
   // Driver stats
   if (ride.driver) {
@@ -513,7 +568,8 @@ export async function finalizeRideSettlement(
     }
   }
 
-  await ride.save();
+  // (No ride.save() — the atomic findOneAndUpdate above already persisted the
+  // settlement fields; the side effects only touch other documents.)
 
   // Loyalty / incentives run lazy so they can't block the response.
   processRideForIncentives(ride).catch((err) =>
@@ -770,20 +826,43 @@ export const createRide = async (req: AuthRequest, res: Response): Promise<void>
     const {
       rideType, pickup, dropoff, stops, paymentMethod,
       promoCode, loyaltyCode, isScheduled, scheduledAt, isPrivate,
+      distance: distanceOverride, duration: durationOverride,
     } = req.body;
 
-    // Calculate fare
-    const R = 6371;
-    const dLat = ((dropoff.lat - pickup.lat) * Math.PI) / 180;
-    const dLng = ((dropoff.lng - pickup.lng) * Math.PI) / 180;
-    const a =
-      Math.sin(dLat / 2) ** 2 +
-      Math.cos((pickup.lat * Math.PI) / 180) *
-        Math.cos((dropoff.lat * Math.PI) / 180) *
-        Math.sin(dLng / 2) ** 2;
-    const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
-    const distance = R * c;
-    const duration = distance * 3;
+    // Distance/duration: prefer the real-route values the client already
+    // resolved via /geo/directions (Google/OSRM road distance) so the
+    // persisted ride matches the quote the rider saw on SelectRide. Only fall
+    // back to straight-line Haversine when the client didn't send them (older
+    // app build, or directions failed). This mirrors `estimateFare` above —
+    // previously createRide ALWAYS recomputed Haversine and silently discarded
+    // the routed distance, so the booked fare/distance disagreed with the quote
+    // whenever Google/OSRM were reachable.
+    const toNum = (v: unknown): number | null => {
+      const n = typeof v === 'number' ? v : parseFloat(String(v));
+      return Number.isFinite(n) && n > 0 ? n : null;
+    };
+    const overrideDistance = toNum(distanceOverride);
+    const overrideDuration = toNum(durationOverride);
+
+    let distance: number;
+    let duration: number;
+    if (overrideDistance !== null && overrideDuration !== null) {
+      distance = overrideDistance;
+      duration = overrideDuration;
+    } else {
+      // Straight-line Haversine fallback (rough 3 min/km for duration).
+      const R = 6371;
+      const dLat = ((dropoff.lat - pickup.lat) * Math.PI) / 180;
+      const dLng = ((dropoff.lng - pickup.lng) * Math.PI) / 180;
+      const a =
+        Math.sin(dLat / 2) ** 2 +
+        Math.cos((pickup.lat * Math.PI) / 180) *
+          Math.cos((dropoff.lat * Math.PI) / 180) *
+          Math.sin(dLng / 2) ** 2;
+      const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+      distance = overrideDistance ?? R * c;
+      duration = overrideDuration ?? distance * 3;
+    }
 
     // Apply promo
     let promoDiscount = 0;
@@ -944,7 +1023,28 @@ export const getRide = async (req: AuthRequest, res: Response): Promise<void> =>
       return;
     }
 
-    res.status(200).json({ success: true, data: { ride } });
+    // Ownership check (IDOR fix): only the ride's own customer/driver (or an
+    // admin) may read it. This endpoint is polled every few seconds by both
+    // apps, so it must allow both participants — but not arbitrary users, who
+    // could otherwise enumerate ride ids to harvest phone numbers + the OTP.
+    const uid = String(req.user!._id);
+    const customerId = String((ride.customer as any)?._id ?? ride.customer);
+    const driverId = ride.driver ? String((ride.driver as any)?._id ?? ride.driver) : null;
+    const isAdmin = req.user!.role === 'admin';
+    if (!isAdmin && uid !== customerId && uid !== driverId) {
+      res.status(403).json({ success: false, message: 'Not your ride' });
+      return;
+    }
+
+    // The pickup OTP is the customer's proof-of-identity to the driver — the
+    // driver must ENTER it, never read it. Strip it for everyone but the
+    // customer so the OTP verification can't be bypassed by a GET.
+    const rideObj: any = ride.toObject();
+    if (uid !== customerId) {
+      delete rideObj.pickupOtp;
+    }
+
+    res.status(200).json({ success: true, data: { ride: rideObj } });
   } catch (error) {
     res.status(500).json({ success: false, message: 'Failed to fetch ride' });
   }
@@ -966,12 +1066,21 @@ const ACTIVE_RIDE_STATUSES = [
   'driver_arriving',
   'driver_arrived',
   'in_progress',
+  // payment_pending: the trip ended but isn't paid. Both apps need to resume
+  // it on cold start — the customer to the pay screen, the driver to the cash
+  // summary — otherwise a killed app stranded the (cash) settlement forever.
+  'payment_pending',
 ] as const;
 
 export const getActiveRide = async (req: AuthRequest, res: Response): Promise<void> => {
   try {
     const filter: Record<string, any> = {
       status: { $in: ACTIVE_RIDE_STATUSES },
+      // Exclude legacy point-to-point "scheduled" Ride docs. The real shuttle
+      // flow uses ScheduledBooking; a Ride created with isScheduled:true has no
+      // driver and can never progress, so without this it would latch as the
+      // customer's "active ride" on every cold start and hijack app resume.
+      isScheduled: { $ne: true },
     };
     if (req.user?.role === 'driver') {
       filter.driver = req.user._id;
@@ -1023,7 +1132,11 @@ export const getRides = async (req: AuthRequest, res: Response): Promise<void> =
     // here and project them to a Ride-shaped row with that flag set.
     // Only relevant for customers — drivers see their bookings via the
     // route registration UI in the driver app.
-    const includeBookings = req.user?.role !== 'admin';
+    // Only CUSTOMERS get scheduled-shuttle bookings merged into ride history.
+    // Drivers previously got their shuttle bookings mixed in as `sched_<id>`
+    // rows whose detail tap called getRide("sched_…") → 500. Drivers see their
+    // journeys in the dedicated scheduled-journeys screen instead.
+    const includeBookings = req.user?.role === 'customer';
 
     const bookingFilter: Record<string, any> = {};
     if (includeBookings && req.user?._id) {
@@ -1153,6 +1266,25 @@ export const getRides = async (req: AuthRequest, res: Response): Promise<void> =
  */
 export const acceptRide = async (req: AuthRequest, res: Response): Promise<void> => {
   try {
+    // Approval gate: only an admin-approved driver may accept a real ride.
+    // `/drivers/registration/step` sets role:'driver' during signup (so a
+    // brand-new account is a "driver" long before vetting), and nothing else
+    // downstream re-checked approval — an unvetted account could go online and
+    // accept live customer rides. Admin approval sets registrationStep:
+    // 'approved' (adminDrivers.ts).
+    const driverUser: any = req.user;
+    if (driverUser?.role !== 'driver') {
+      res.status(403).json({ success: false, message: 'Only drivers can accept rides' });
+      return;
+    }
+    if (driverUser?.driverProfile?.registrationStep !== 'approved') {
+      res.status(403).json({
+        success: false,
+        message: 'Your driver account is pending approval. You cannot accept rides yet.',
+      });
+      return;
+    }
+
     // Atomic claim — prevents two drivers from both winning the same ride
     // when their taps overlap. findOneAndUpdate with the status guard
     // returns null for the loser.
@@ -1407,6 +1539,17 @@ export const verifyRideOtp = async (req: AuthRequest, res: Response): Promise<vo
       res.status(403).json({ success: false, message: 'Not your ride' });
       return;
     }
+    // OTP verification only makes sense while the ride is live and pre-trip.
+    // A cancelled ride can still carry a pickupOtp (cancel doesn't clear it),
+    // so without this a cancelled ride could be flipped to 'in_progress' by
+    // entering the OTP.
+    if (!['driver_assigned', 'driver_arriving', 'driver_arrived'].includes(ride.status)) {
+      res.status(400).json({
+        success: false,
+        message: 'This ride is not ready to start.',
+      });
+      return;
+    }
     // OTP only meaningful between assignment and trip start. After that
     // the field is cleared, so a missing OTP also means "already used".
     if (!ride.pickupOtp) {
@@ -1459,17 +1602,38 @@ export const updateRideStatus = async (req: AuthRequest, res: Response): Promise
     //   payment_pending → completed   : settlement has been recorded.
     //     This is where commissions, driver earnings, wallet credit, and
     //     payment records are written. After this point the trip is final.
+    // This is the DRIVER-facing progression endpoint. Two transitions were
+    // removed for safety:
+    //   • driver_arrived → in_progress : trip start MUST go through
+    //     verifyRideOtp (the OTP gate). Allowing it here let a driver start
+    //     the trip without the passenger's OTP.
+    //   • payment_pending → completed  : settlement MUST go through a payment
+    //     path (wallet pay-ride / Razorpay verify / driver cash-confirm), all
+    //     of which call finalizeRideSettlement. Allowing a driver to
+    //     self-complete credited their wallet with NO payment collected.
+    // 'driver_arrived' is also reachable directly from 'driver_assigned' so
+    // the "I've arrived" button works before the geofence flips to arriving.
     const validTransitions: Record<string, string[]> = {
-      driver_assigned: ['driver_arriving'],
+      driver_assigned: ['driver_arriving', 'driver_arrived'],
       driver_arriving: ['driver_arrived'],
-      driver_arrived: ['in_progress'],
       in_progress: ['payment_pending'],
-      payment_pending: ['completed'],
     };
 
     const ride = await Ride.findById(req.params.id);
     if (!ride) {
       res.status(404).json({ success: false, message: 'Ride not found' });
+      return;
+    }
+
+    // Only the assigned driver (or an admin) may move a ride's status. Without
+    // this, any authenticated account could walk an arbitrary ride through its
+    // lifecycle (and, via the old completed transition, settle it).
+    const isAdmin = req.user!.role === 'admin';
+    if (!isAdmin && (!ride.driver || String(ride.driver) !== String(req.user!._id))) {
+      res.status(403).json({
+        success: false,
+        message: 'Only the assigned driver can update this ride',
+      });
       return;
     }
 
@@ -1502,92 +1666,12 @@ export const updateRideStatus = async (req: AuthRequest, res: Response): Promise
       }
     }
 
-    // Step 2 — settlement landed (wallet/Razorpay/cash-confirmed). All
-    // financial records and stats live here so they can't fire twice if
-    // a payment retry pushes the ride back through this transition.
-    if (status === 'completed') {
-      // Calculate commission + driver earnings
-      const isOnePass = req.user?.driverProfile?.isOnePass;
-      const rideSettings = await getRideSettings();
-      const commissionRate = isOnePass
-        ? rideSettings.onePassCommissionRate
-        : rideSettings.commissionRate;
-      ride.commission = Math.round((ride.actualFare ?? 0) * commissionRate * 100) / 100;
-      ride.driverEarnings =
-        Math.round(((ride.actualFare ?? 0) - ride.commission + (ride.tip ?? 0)) * 100) / 100;
-      ride.paymentStatus = 'completed';
-
-      // Update driver stats
-      await User.findByIdAndUpdate(ride.driver, {
-        $inc: {
-          'driverProfile.totalTrips': 1,
-          'driverProfile.totalEarnings': ride.driverEarnings,
-        },
-      });
-
-      // Customer-side payment record (gross fare, debits the customer's
-      // ledger). Note: this is the rider-paid amount, not what the driver
-      // takes home — the driver-facing record is created below.
-      await Payment.create({
-        user: ride.customer,
-        ride: ride._id,
-        type: 'ride_payment',
-        amount: ride.actualFare,
-        method: ride.paymentMethod,
-        status: 'completed',
-        description: `Ride payment - ${ride.rideType}`,
-      });
-
-      // Driver-side: credit the wallet by net earnings (fare − commission +
-      // tip) AND create a Payment row owned by the driver so it appears in
-      // their statement. Without this, the driver UI showed "+₹500" in the
-      // tx list but balance stayed at zero, because the existing Payment
-      // record was filed under the customer and the wallet was never
-      // touched on completion.
-      if (ride.driverEarnings && ride.driverEarnings > 0) {
-        await Wallet.findOneAndUpdate(
-          { user: ride.driver },
-          { $inc: { balance: ride.driverEarnings } },
-          { upsert: true, new: true },
-        );
-        await Payment.create({
-          user: ride.driver,
-          ride: ride._id,
-          type: 'ride_payment',
-          amount: ride.driverEarnings,
-          method: 'wallet',
-          status: 'completed',
-          description: `Ride earning - ${ride.rideType} (after ${Math.round(commissionRate * 100)}% commission)`,
-        });
-
-        // Commission row (informational — money the platform keeps, NOT
-        // debited from anywhere because the rider already paid it as part
-        // of the gross fare). Useful for admin reconciliation reports.
-        if (ride.commission && ride.commission > 0) {
-          await Payment.create({
-            user: ride.driver,
-            ride: ride._id,
-            type: 'commission',
-            amount: ride.commission,
-            method: 'wallet',
-            status: 'completed',
-            description: `Platform commission (${Math.round(commissionRate * 100)}%)`,
-          });
-        }
-      }
-    }
+    // (Settlement — commission, driver earnings, wallet credit, payment rows,
+    // incentives — is NOT done here anymore. It lives solely in
+    // finalizeRideSettlement, invoked by the payment paths, so it runs exactly
+    // once and only after money is actually collected.)
 
     await ride.save();
-
-    // Run incentives engine asynchronously on ride completion
-    if (status === 'completed') {
-      processRideForIncentives(ride).catch((err) =>
-        console.error('[incentives] processRideForIncentives failed:', err)
-      );
-      awardPointsForRide(ride).catch((err) =>
-        console.error('[loyalty] awardPointsForRide failed:', err)
-      );
-    }
 
     // Push the new status to everyone watching this ride (customer +
     // driver), and also direct-emit to the customer in case they haven't
@@ -1622,6 +1706,17 @@ export const cancelRide = async (req: AuthRequest, res: Response): Promise<void>
       res.status(400).json({ success: false, message: 'Ride cannot be cancelled' });
       return;
     }
+    // payment_pending means the trip physically ended and the fare is locked —
+    // the driver drove the whole route and must be paid. Cancelling here let a
+    // rider ride for free (no settlement runs, and the fee list below excludes
+    // payment_pending so fee=0). Pay the ride instead of cancelling it.
+    if (ride.status === 'payment_pending') {
+      res.status(400).json({
+        success: false,
+        message: 'This trip has ended and is awaiting payment. Please pay for the ride.',
+      });
+      return;
+    }
 
     // Only the ride's own customer or assigned driver may cancel it (admins
     // use the admin route). Without this, any authenticated user could cancel
@@ -1635,7 +1730,13 @@ export const cancelRide = async (req: AuthRequest, res: Response): Promise<void>
     }
 
     const cancelledBy = isDriver ? 'driver' : 'customer';
-    const hasFee = ['driver_arriving', 'driver_arrived', 'in_progress'].includes(ride.status);
+    // A cancellation fee only applies when the CUSTOMER cancels late — never
+    // when the driver bails. Previously the fee was charged regardless of who
+    // cancelled, so a driver cancelling mid-trip generated a fee against the
+    // (innocent) customer.
+    const hasFee =
+      cancelledBy === 'customer' &&
+      ['driver_arriving', 'driver_arrived', 'in_progress'].includes(ride.status);
     const fee = hasFee ? (await getRideSettings()).cancellationFee : 0;
 
     ride.status = 'cancelled';
@@ -1675,16 +1776,26 @@ export const cancelRide = async (req: AuthRequest, res: Response): Promise<void>
       });
     }
 
-    // Create cancellation fee payment if applicable
+    // Cancellation fee — actually collect it from the wallet instead of just
+    // writing a `completed` ledger row for money that never moved (which
+    // overstated revenue). If the wallet can't cover it, record the fee as
+    // `pending` (owed) rather than pretending it was paid.
     if (fee > 0) {
+      const debited = await Wallet.findOneAndUpdate(
+        { user: ride.customer, balance: { $gte: fee } },
+        { $inc: { balance: -fee } },
+        { new: true },
+      );
       await Payment.create({
         user: ride.customer,
         ride: ride._id,
         type: 'cancellation_fee',
         amount: fee,
-        method: ride.paymentMethod,
-        status: 'completed',
-        description: `Cancellation fee for ride`,
+        method: 'wallet',
+        status: debited ? 'completed' : 'pending',
+        description: debited
+          ? 'Cancellation fee'
+          : 'Cancellation fee (unpaid — insufficient wallet balance)',
       });
     }
 
@@ -1795,25 +1906,58 @@ export const rateRide = async (req: AuthRequest, res: Response): Promise<void> =
       ride.rating!.customerComment = comment;
       ride.rating!.tags = tags;
 
-      // Handle tip
-      if (tip && tip > 0) {
-        ride.tip = tip;
-        ride.driverEarnings += tip;
+      // Tip — idempotent (applied at most once) and actually moved from the
+      // customer's wallet to the driver's wallet. Previously it (a) stacked on
+      // every re-submit via `driverEarnings += tip`, (b) recorded a
+      // "completed" charge that never debited the customer, and (c) credited
+      // only the driver's stat, never their spendable wallet.
+      if (tip && tip > 0 && !(ride.tip && ride.tip > 0)) {
+        const tipAmt = Math.round(Number(tip) * 100) / 100;
+        const debited = await Wallet.findOneAndUpdate(
+          { user: ride.customer, balance: { $gte: tipAmt } },
+          { $inc: { balance: -tipAmt } },
+          { new: true },
+        );
+        if (!debited) {
+          res.status(400).json({
+            success: false,
+            message: 'Insufficient wallet balance to tip. Top up your wallet and try again.',
+          });
+          return;
+        }
+        ride.tip = tipAmt;
+        ride.driverEarnings = (ride.driverEarnings || 0) + tipAmt;
         await ride.save();
 
         await Payment.create({
           user: ride.customer,
           ride: ride._id,
           type: 'tip',
-          amount: tip,
-          method: ride.paymentMethod,
+          amount: tipAmt,
+          method: 'wallet',
           status: 'completed',
           description: 'Driver tip',
         });
 
-        await User.findByIdAndUpdate(ride.driver, {
-          $inc: { 'driverProfile.totalEarnings': tip },
-        });
+        if (ride.driver) {
+          await Wallet.findOneAndUpdate(
+            { user: ride.driver },
+            { $inc: { balance: tipAmt } },
+            { upsert: true },
+          );
+          await User.findByIdAndUpdate(ride.driver, {
+            $inc: { 'driverProfile.totalEarnings': tipAmt },
+          });
+          await Payment.create({
+            user: ride.driver,
+            ride: ride._id,
+            type: 'tip',
+            amount: tipAmt,
+            method: 'wallet',
+            status: 'completed',
+            description: 'Tip received',
+          });
+        }
       }
 
       // Update driver rating (running average)

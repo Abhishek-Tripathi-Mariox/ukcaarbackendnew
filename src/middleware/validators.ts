@@ -44,6 +44,10 @@ export const createRideValidation = [
   body('dropoff.lat').isFloat({ min: -90, max: 90 }),
   body('dropoff.lng').isFloat({ min: -180, max: 180 }),
   body('paymentMethod').optional().isIn(['card', 'cash', 'wallet']),
+  // Optional real-route values from /geo/directions, so the booked ride keeps
+  // the road distance/duration the rider was quoted instead of straight-line.
+  body('distance').optional().isFloat({ min: 0 }),
+  body('duration').optional().isFloat({ min: 0 }),
 ];
 
 export const rateRideValidation = [

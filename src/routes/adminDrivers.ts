@@ -310,6 +310,9 @@ router.post(
           disabledAt: new Date(),
           disabledReason: reason,
           'driverProfile.isOnline': false,
+          // Revoke the session too — without this the suspended driver keeps
+          // a working app session until their access token happens to expire.
+          refreshToken: null,
         },
         { new: true },
       );

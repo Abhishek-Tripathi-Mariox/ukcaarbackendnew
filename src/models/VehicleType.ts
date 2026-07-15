@@ -52,6 +52,11 @@ export interface IVehicleType extends Document {
   perKmFare?: number;
   perMinFare?: number;
   minFare?: number;
+  /** Passenger seat capacity for this vehicle type (excludes the driver).
+   *  Shown on the customer SelectRide screen ("N Seats"). When unset, the
+   *  customer app falls back to a code-based heuristic, so existing types
+   *  keep working until an admin fills this in. */
+  seats?: number;
   createdAt: Date;
   updatedAt: Date;
 }
@@ -80,6 +85,7 @@ const vehicleTypeSchema = new Schema<IVehicleType>(
     perKmFare: { type: Number, min: 0 },
     perMinFare: { type: Number, min: 0 },
     minFare: { type: Number, min: 0 },
+    seats: { type: Number, min: 1, max: 60 },
   },
   { timestamps: true }
 );

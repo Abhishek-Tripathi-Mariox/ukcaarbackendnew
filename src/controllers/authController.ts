@@ -38,7 +38,7 @@ export const sendOtp = async (req: Request, res: Response): Promise<void> => {
       return;
     }
 
-    const { phone, countryCode = '+44' } = req.body;
+    const { phone, countryCode = '+44', appType } = req.body;
     const fullPhone = `${countryCode}${phone.replace(/\s/g, '')}`;
 
     // Generate OTP
@@ -47,6 +47,33 @@ export const sendOtp = async (req: Request, res: Response): Promise<void> => {
 
     // Find or create user
     let user = await User.findOne({ phone: fullPhone });
+
+    // App-scoped role guard. The customer and driver apps share this OTP
+    // endpoint, so a driver/admin account must not be able to sign into the
+    // customer app. The customer app sends appType:'customer'; the driver app
+    // omits it (its new signups default to role:'customer' until registration
+    // sets role:'driver', so we deliberately do NOT enforce the driver side
+    // here). Fail fast before an OTP is ever issued.
+    if (user && appType === 'customer' && user.role !== 'customer') {
+      res.status(403).json({
+        success: false,
+        message: 'This number is registered as a driver. Please use the UKCAAR Driver app to sign in.',
+      });
+      return;
+    }
+
+    // Suspended accounts must not receive an OTP at all. The authenticate
+    // middleware already rejects isActive=false on API calls, but without
+    // this check the OTP LOGIN itself succeeded and the app landed a
+    // suspended user on Home with a dead token.
+    if (user && !user.isActive) {
+      res.status(403).json({
+        success: false,
+        message: 'Your account has been suspended. Please contact support.',
+      });
+      return;
+    }
+
     if (!user) {
       user = new User({
         phone: fullPhone,
@@ -91,12 +118,32 @@ export const verifyOtp = async (req: Request, res: Response): Promise<void> => {
       return;
     }
 
-    const { phone, otp, countryCode = '+44' } = req.body;
+    const { phone, otp, countryCode = '+44', appType } = req.body;
     const fullPhone = `${countryCode}${phone.replace(/\s/g, '')}`;
 
     const user = await User.findOne({ phone: fullPhone }).select('+otp +otpExpiry');
     if (!user) {
       res.status(404).json({ success: false, message: 'User not found' });
+      return;
+    }
+
+    // App-scoped role guard (see sendOtp): keep drivers/admins out of the
+    // customer app even if they somehow reach verify-otp directly.
+    if (appType === 'customer' && user.role !== 'customer') {
+      res.status(403).json({
+        success: false,
+        message: 'This number is registered as a driver. Please use the UKCAAR Driver app to sign in.',
+      });
+      return;
+    }
+
+    // Suspended accounts: refuse token issuance (see sendOtp). Checked here
+    // too because verify-otp is public and an OTP may pre-date the suspension.
+    if (!user.isActive) {
+      res.status(403).json({
+        success: false,
+        message: 'Your account has been suspended. Please contact support.',
+      });
       return;
     }
 
@@ -172,7 +219,9 @@ export const refreshToken = async (req: Request, res: Response): Promise<void> =
     };
 
     const user = await User.findById(decoded.userId).select('+refreshToken');
-    if (!user || user.refreshToken !== token) {
+    // !isActive: a suspended user's live session must not keep minting fresh
+    // access tokens — suspension takes effect at the next refresh at latest.
+    if (!user || user.refreshToken !== token || !user.isActive) {
       res.status(401).json({ success: false, message: 'Invalid refresh token' });
       return;
     }
@@ -329,7 +378,15 @@ export const updateProfile = async (req: AuthRequest, res: Response): Promise<vo
   try {
     const errors = validationResult(req);
     if (!errors.isEmpty()) {
-      res.status(400).json({ success: false, errors: errors.array() });
+      // Include a human-readable message — the apps surface `message` only,
+      // so a bare errors[] rendered as the useless generic "Profile update
+      // failed" with no hint of what was wrong.
+      const first = errors.array()[0] as any;
+      res.status(400).json({
+        success: false,
+        message: first?.msg ? `${first.path ?? 'Field'}: ${first.msg}` : 'Invalid profile data',
+        errors: errors.array(),
+      });
       return;
     }
 
@@ -340,20 +397,43 @@ export const updateProfile = async (req: AuthRequest, res: Response): Promise<vo
         updateData[field] = req.body[field];
       }
     }
+    // Blank email means "remove my email", and must be $unset rather than
+    // written as ''. The email unique index is sparse, which skips ABSENT
+    // fields but not empty strings — so persisting '' for two users throws
+    // E11000 and every later profile save 500s (same bug previously fixed at
+    // signup by removing `default: ''` on the schema).
+    const unsetData: Record<string, 1> = {};
+    if (updateData.email !== undefined && String(updateData.email).trim() === '') {
+      delete updateData.email;
+      unsetData.email = 1;
+    }
     // Mark profile as setup once user provides their name
     if (updateData.firstName) {
       updateData.isProfileSetup = true;
     }
 
-    const user = await User.findByIdAndUpdate(req.user?._id, updateData, {
-      new: true,
-      runValidators: true,
-    });
+    const user = await User.findByIdAndUpdate(
+      req.user?._id,
+      Object.keys(unsetData).length ? { $set: updateData, $unset: unsetData } : updateData,
+      {
+        new: true,
+        runValidators: true,
+      },
+    );
 
     res.status(200).json({ success: true, data: { user } });
   } catch (error: any) {
     console.error('updateProfile error:', error?.message, error?.code, error?.keyPattern);
-    res.status(500).json({ success: false, message: error?.message || 'Profile update failed' });
+    // Duplicate-key (E11000) on the unique email index — tell the user what
+    // actually happened instead of a raw Mongo error string via a 500.
+    if (error?.code === 11000 && error?.keyPattern?.email) {
+      res.status(409).json({
+        success: false,
+        message: 'This email is already in use by another account.',
+      });
+      return;
+    }
+    res.status(500).json({ success: false, message: 'Profile update failed' });
   }
 };
 

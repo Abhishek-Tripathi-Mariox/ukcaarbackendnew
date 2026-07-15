@@ -1,7 +1,7 @@
 import { Request, Response } from 'express';
 import crypto from 'crypto';
 import Razorpay from 'razorpay';
-import { Payment, Wallet, User, SavedPaymentMethod, RechargeOffer } from '../models';
+import { Payment, Wallet, User, SavedPaymentMethod, RechargeOffer, Ride } from '../models';
 import { AuthRequest } from '../middleware/auth';
 import { config } from '../config';
 
@@ -223,6 +223,40 @@ export const createOrder = async (req: AuthRequest, res: Response): Promise<void
       chargeAmount = quote.total;
       walletCredit = quote.walletCredit;
       bonusAmount = quote.bonus;
+    } else if (type === 'ride_payment') {
+      // NEVER trust the client's amount for a ride — derive it from the ride
+      // itself. Previously any rider could create a ₹1 order for a ₹500 ride
+      // and verify-payment would settle the full fare. Also enforce ownership
+      // and that the ride is actually awaiting payment.
+      if (!rideId) {
+        res.status(400).json({ success: false, message: 'rideId is required' });
+        return;
+      }
+      const ride = await Ride.findById(rideId);
+      if (!ride) {
+        res.status(404).json({ success: false, message: 'Ride not found' });
+        return;
+      }
+      if (String(ride.customer) !== String(req.user!._id)) {
+        res.status(403).json({ success: false, message: 'Not your ride' });
+        return;
+      }
+      if (ride.status !== 'payment_pending') {
+        res.status(400).json({
+          success: false,
+          message: ride.status === 'completed' ? 'This ride is already paid' : 'This ride is not awaiting payment',
+        });
+        return;
+      }
+      if (ride.paymentStatus === 'completed') {
+        res.status(400).json({ success: false, message: 'This ride is already paid' });
+        return;
+      }
+      chargeAmount = Number(ride.actualFare ?? ride.estimatedFare ?? 0);
+      if (!(chargeAmount > 0)) {
+        res.status(400).json({ success: false, message: 'Ride amount unavailable' });
+        return;
+      }
     } else if (!amount || amount <= 0) {
       res.status(400).json({ success: false, message: 'Invalid amount' });
       return;
@@ -307,6 +341,26 @@ export const createOrder = async (req: AuthRequest, res: Response): Promise<void
  */
 export const checkoutPage = async (req: Request, res: Response): Promise<void> => {
   const { orderId, amount, currency, keyId, callbackUrl } = req.query;
+
+  // These values land in an HTML <script> context, so every one is emitted as
+  // a properly-escaped JS string literal (JSON.stringify + `<` escaping) to
+  // prevent reflected XSS. The callback is additionally forced to this
+  // server's own origin so a hostile `callbackUrl` can't exfiltrate the
+  // razorpay signature/payment id to an attacker's host (open redirect).
+  const jsStr = (v: unknown): string =>
+    JSON.stringify(String(v ?? '')).replace(/</g, '\\u003c');
+
+  const selfCallback = `${req.protocol}://${req.get('host')}/api/v1/payments/checkout/callback`;
+  let cb = selfCallback;
+  try {
+    const u = new URL(String(callbackUrl ?? ''));
+    if ((u.protocol === 'http:' || u.protocol === 'https:') && u.host === req.get('host')) {
+      cb = u.toString();
+    }
+  } catch {
+    /* not a valid absolute URL → keep the server's own callback */
+  }
+
   const html = `<!DOCTYPE html>
 <html><head>
 <meta name="viewport" content="width=device-width,initial-scale=1">
@@ -318,11 +372,12 @@ export const checkoutPage = async (req: Request, res: Response): Promise<void> =
 </head><body>
 <div class="loading"><div class="spinner"></div><p>Opening payment...</p></div>
 <script>
-var options={key:"${keyId}",amount:"${amount}",currency:"${currency}",name:"UKCAAR",
-description:"UKCAAR Payment",order_id:"${orderId}",
+var CB=${jsStr(cb)};
+var options={key:${jsStr(keyId)},amount:${jsStr(amount)},currency:${jsStr(currency)},name:"UKCAAR",
+description:"UKCAAR Payment",order_id:${jsStr(orderId)},
 theme:{color:"#0097B3"},
-handler:function(r){window.location.href="${callbackUrl}?razorpay_payment_id="+r.razorpay_payment_id+"&razorpay_order_id="+r.razorpay_order_id+"&razorpay_signature="+r.razorpay_signature;},
-modal:{ondismiss:function(){window.location.href="${callbackUrl}?cancelled=true";}}};
+handler:function(r){window.location.href=CB+"?razorpay_payment_id="+encodeURIComponent(r.razorpay_payment_id)+"&razorpay_order_id="+encodeURIComponent(r.razorpay_order_id)+"&razorpay_signature="+encodeURIComponent(r.razorpay_signature);},
+modal:{ondismiss:function(){window.location.href=CB+"?cancelled=true";}}};
 var rzp=new Razorpay(options);rzp.open();
 </script></body></html>`;
   res.setHeader('Content-Type', 'text/html');
@@ -361,8 +416,11 @@ export const checkoutCallback = async (req: Request, res: Response): Promise<voi
       .digest('hex');
 
     if (expectedSignature === razorpay_signature) {
+      // Idempotency guard (see verifyPayment): only credit on the first
+      // completion. Replaying this callback URL (it sits in browser history)
+      // must not re-credit the wallet.
       const payment = await Payment.findOneAndUpdate(
-        { razorpayOrderId: razorpay_order_id as string },
+        { razorpayOrderId: razorpay_order_id as string, status: { $ne: 'completed' } },
         { status: 'completed', razorpayPaymentId: razorpay_payment_id as string },
         { new: true },
       );
@@ -377,6 +435,11 @@ export const checkoutCallback = async (req: Request, res: Response): Promise<voi
           );
         }
         await activateOnePassFromPayment(payment);
+      } else {
+        // No pending order to complete — already processed (replay) or unknown.
+        // Show the success page either way; do NOT re-credit.
+        const existing = await Payment.findOne({ razorpayOrderId: razorpay_order_id as string });
+        success = !!(existing && existing.status === 'completed');
       }
     }
   }
@@ -435,9 +498,13 @@ export const verifyPayment = async (req: AuthRequest, res: Response): Promise<vo
       return;
     }
 
-    // Update payment record
+    // Idempotency guard: only flip an order that hasn't already completed.
+    // Without the `status != completed` condition, replaying the same (valid)
+    // razorpay ids re-ran the wallet credit / ride settlement below on every
+    // call — a repeatable money exploit. The atomic conditional update makes
+    // the first caller win and every replay find nothing.
     const payment = await Payment.findOneAndUpdate(
-      { razorpayOrderId: razorpay_order_id },
+      { razorpayOrderId: razorpay_order_id, status: { $ne: 'completed' } },
       {
         status: 'completed',
         razorpayPaymentId: razorpay_payment_id,
@@ -446,6 +513,18 @@ export const verifyPayment = async (req: AuthRequest, res: Response): Promise<vo
     );
 
     if (!payment) {
+      // Either the order doesn't exist, or it was already completed (replay).
+      // Respond idempotently on an already-completed order without re-crediting.
+      const existing = await Payment.findOne({ razorpayOrderId: razorpay_order_id });
+      if (existing && existing.status === 'completed') {
+        const wallet = await Wallet.findOne({ user: existing.user });
+        res.status(200).json({
+          success: true,
+          message: 'Payment already verified',
+          data: { payment: existing, wallet },
+        });
+        return;
+      }
       res.status(404).json({ success: false, message: 'Payment record not found' });
       return;
     }
@@ -903,14 +982,6 @@ export const requestCashout = async (req: AuthRequest, res: Response): Promise<v
     }
 
     const totalDebit = amount + FEE;
-    const wallet = await Wallet.findOne({ user: req.user!._id });
-    if (!wallet || wallet.balance < totalDebit) {
-      res.status(400).json({
-        success: false,
-        message: 'Insufficient wallet balance (including ₹5 transaction fee)',
-      });
-      return;
-    }
 
     // Snapshot the destination so it survives later bank-detail edits.
     const user = await User.findById(req.user!._id);
@@ -934,10 +1005,23 @@ export const requestCashout = async (req: AuthRequest, res: Response): Promise<v
       return;
     }
 
-    // Atomic-ish: debit first, then create payment. If payment.create throws
-    // we credit back. Wallet has its own balance >= 0 schema guard.
-    wallet.balance = Math.max(0, wallet.balance - totalDebit);
-    await wallet.save();
+    // Atomic conditional debit — only succeeds if balance >= totalDebit. The
+    // previous read-check-save let two concurrent cashout requests both pass
+    // the check and both save the same decremented balance, so the driver was
+    // paid out twice for one debit. `$gte` in the filter makes the second
+    // concurrent request find no matching doc.
+    const wallet = await Wallet.findOneAndUpdate(
+      { user: req.user!._id, balance: { $gte: totalDebit } },
+      { $inc: { balance: -totalDebit } },
+      { new: true },
+    );
+    if (!wallet) {
+      res.status(400).json({
+        success: false,
+        message: 'Insufficient wallet balance (including ₹5 transaction fee)',
+      });
+      return;
+    }
 
     let payment;
     try {
@@ -958,8 +1042,11 @@ export const requestCashout = async (req: AuthRequest, res: Response): Promise<v
             : `Cashout to UPI ${upiId}`,
       });
     } catch (err) {
-      wallet.balance = wallet.balance + totalDebit;
-      await wallet.save();
+      // Refund the debit atomically if the payment row couldn't be created.
+      await Wallet.findOneAndUpdate(
+        { user: req.user!._id },
+        { $inc: { balance: totalDebit } },
+      );
       throw err;
     }
 

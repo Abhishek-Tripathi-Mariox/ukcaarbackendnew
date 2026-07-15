@@ -615,6 +615,7 @@ router.get('/:key/passengers', async (req: AuthRequest, res: Response) => {
     for (const b of bookings) {
       const boarded = new Set(b.boardedSeats ?? []);
       const noShow = new Set(b.noShowSeats ?? []);
+      const dropped = new Set(b.droppedSeats ?? []);
       for (const seat of b.seats ?? []) {
         const pax = (b.passengers ?? []).find((p) => p.seat === seat);
         const cust: any = b.customer;
@@ -628,6 +629,8 @@ router.get('/:key/passengers', async (req: AuthRequest, res: Response) => {
           contact: pax?.contact || cust?.phone || '',
           boarded: boarded.has(seat),
           noShow: noShow.has(seat),
+          // Dropped early (got off before their booked stop) — no longer on board.
+          dropped: dropped.has(seat),
         });
       }
     }
@@ -640,6 +643,9 @@ router.get('/:key/passengers', async (req: AuthRequest, res: Response) => {
         total: passengers.length,
         boarded: passengers.filter((p) => p.boarded).length,
         noShow: passengers.filter((p) => p.noShow).length,
+        dropped: passengers.filter((p) => p.dropped).length,
+        // Currently on the bus = boarded and not yet dropped off.
+        onBoard: passengers.filter((p) => p.boarded && !p.dropped).length,
       },
     });
   } catch (err) {
@@ -1144,6 +1150,51 @@ router.post('/:key/complete', async (req: AuthRequest, res: Response) => {
   } catch (err) {
     console.error('[Journey complete] error:', err);
     res.status(500).json({ success: false, message: 'Failed to complete journey' });
+  }
+});
+
+/**
+ * POST /api/v1/drivers/journeys/:key/rate-passengers
+ * The driver rates the riders on their trip. Body:
+ * { ratings: [{ bookingId, rating: 1..5, comment? }] }. Each rating is stored on
+ * the matching booking (scoped to this driver's journey).
+ */
+router.post('/:key/rate-passengers', async (req: AuthRequest, res: Response) => {
+  try {
+    const parsed = parseKey(req.params.key);
+    if (!parsed) {
+      res.status(400).json({ success: false, message: 'Invalid journey' });
+      return;
+    }
+    const ratings = Array.isArray(req.body?.ratings) ? req.body.ratings : [];
+    if (ratings.length === 0) {
+      res.status(400).json({ success: false, message: 'ratings array is required' });
+      return;
+    }
+    let updated = 0;
+    for (const r of ratings) {
+      const bId = String(r?.bookingId || '');
+      const val = Number(r?.rating);
+      if (!mongoose.isValidObjectId(bId) || !(val >= 1 && val <= 5)) continue;
+      const booking = await ScheduledBooking.findOne({
+        _id: bId,
+        route: parsed.routeId,
+        driver: req.user!._id,
+        departureIndex: parsed.index,
+        departureDate: parsed.date,
+      });
+      if (!booking) continue;
+      booking.driverToCustomerRating = Math.round(val);
+      if (typeof r?.comment === 'string' && r.comment.trim()) {
+        booking.driverComment = r.comment.trim();
+      }
+      await booking.save();
+      updated++;
+    }
+    res.json({ success: true, data: { updated } });
+  } catch (err) {
+    console.error('[Journey rate-passengers] error:', err);
+    res.status(500).json({ success: false, message: 'Failed to save ratings' });
   }
 });
 

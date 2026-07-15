@@ -89,6 +89,10 @@ export interface IScheduledBooking extends Document {
    *  "How Was Your Ride?" screen after an early drop or completed shuttle trip. */
   rating?: number;
   feedback?: string;
+  /** Driver's rating (1–5) of THIS rider + optional note, captured on the
+   *  driver's "Rate Passengers" screen at journey end. */
+  driverToCustomerRating?: number;
+  driverComment?: string;
   /** Who cancelled the seat and why. Populated on cancel so admin/customer
    *  history can show the same "cancelled by + reason" detail that Ride
    *  records carry. */
@@ -157,6 +161,8 @@ const scheduledBookingSchema = new Schema<IScheduledBooking>(
     boardedAt: { type: Date },
     rating: { type: Number, min: 1, max: 5 },
     feedback: { type: String, trim: true },
+    driverToCustomerRating: { type: Number, min: 1, max: 5 },
+    driverComment: { type: String, trim: true },
     cancellation: {
       cancelledBy: { type: String, enum: ['customer', 'driver', 'admin', 'system'] },
       reason: String,

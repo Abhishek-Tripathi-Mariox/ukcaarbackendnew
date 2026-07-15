@@ -864,16 +864,15 @@ export const bookRouteSeats = async (
           .filter((p: any) => p.name)
       : [];
 
-    // Server-authoritative price — NEVER trust the client's `totalAmount`,
-    // which let a tampered client reserve any number of seats for ₹1 (and
-    // poisoned driver-journey settlement, since gross is derived from it).
-    // Priced from the route's configured per-seat price. NOTE: routes that use
-    // per-segment `fareFromPrevious` pricing are charged the flat seatPrice
-    // here — threading boarding/dropping indices through for exact segment
-    // pricing is a tracked follow-up; this closes the under-pricing exploit.
-    const seatPrice = Number(route.schedule?.seatPrice) || 0;
-    const amount =
-      seatPrice > 0 ? seatList.length * seatPrice : Number(totalAmount) || 0;
+    // Charge exactly the amount the rider was shown and agreed to (the app
+    // computes it from the route's per-segment `fareFromPrevious` fares, which
+    // can legitimately sum to MORE or LESS than a single flat seatPrice). Do
+    // NOT derive it from a flat seatPrice here — that over-charged short
+    // segments and UNDER-charged long ones (shown ₹4000 but debited the flat
+    // ~₹1000). Exact server-side segment pricing (to also enforce a FLOOR
+    // against a tampered client under-paying) needs the boarding/dropping stop
+    // indices persisted — that's a tracked follow-up.
+    const amount = Number(totalAmount) || 0;
 
     // ── Wallet payment ──
     // When the rider pays from their UKCAAR wallet, the debit MUST happen

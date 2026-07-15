@@ -311,11 +311,12 @@ export const getMyRatings = async (req: AuthRequest, res: Response): Promise<voi
       ? Math.round((scores.reduce((a, b) => a + b, 0) / totalRides) * 10) / 10
       : 0;
 
-    // Recent text comments, enriched with the reviewer's name/avatar/date so
-    // the driver dashboard's Reviews card can render real rows (name • date •
-    // stars • text) instead of Figma placeholder people.
+    // Recent reviews, enriched with the reviewer's name/avatar/date so the
+    // driver dashboard's Reviews card can render real rows (name • date •
+    // stars • text) instead of Figma placeholder people. Star-only ratings
+    // (no written comment) ARE included — they just render without a comment
+    // line; previously they were filtered out and invisible on the dashboard.
     const comments = rated
-      .filter((r) => r.rating?.customerComment)
       .slice(0, 10)
       .map((r, i) => {
         const c: any = (r as any).customer;
@@ -325,7 +326,7 @@ export const getMyRatings = async (req: AuthRequest, res: Response): Promise<voi
         return {
           id: String((r as any)._id ?? i),
           stars: r.rating!.customerToDriver as number,
-          text: r.rating!.customerComment as string,
+          text: (r.rating?.customerComment as string) || '',
           source: 'Rider',
           reviewerName,
           reviewerAvatar: c?.avatar ?? null,

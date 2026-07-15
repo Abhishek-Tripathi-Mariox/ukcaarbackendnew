@@ -1286,3 +1286,131 @@ export const rateBooking = async (
     res.status(500).json({ success: false, message: 'Failed to save feedback' });
   }
 };
+
+/**
+ * GET /api/v1/routes/bookings/:bookingId/status
+ *
+ * Live trip-state for the rider's scheduled-shuttle onboarding hub. Returns the
+ * everything the hub needs to pick the right stage (Departing → Bus Arriving →
+ * Bus Arrived → Show Ticket → Boarded → Track Live). Cheap enough to poll.
+ */
+export const getBookingStatus = async (
+  req: AuthRequest,
+  res: Response,
+): Promise<void> => {
+  try {
+    const cleanId = String(req.params.bookingId).replace(/^sched_/, '');
+    const { ScheduledBooking, DriverJourney, User } = await import('../models');
+    const booking = await ScheduledBooking.findById(cleanId).lean();
+    if (!booking) {
+      res.status(404).json({ success: false, message: 'Booking not found' });
+      return;
+    }
+    if (String(booking.customer) !== String(req.user!._id)) {
+      res.status(403).json({ success: false, message: 'Not your booking' });
+      return;
+    }
+
+    const routeDoc = await Route.findById(booking.route)
+      .select('name stops schedule')
+      .lean();
+    const stops = [...(routeDoc?.stops ?? [])].sort(
+      (a: any, b: any) => (a.sequence ?? 0) - (b.sequence ?? 0),
+    );
+    const stopBySeq = (seq?: number) =>
+      typeof seq === 'number' ? stops.find((s: any) => (s.sequence ?? 0) === seq) : undefined;
+    const boardingStop = stopBySeq(booking.boardingStopSequence) ?? stops[0];
+    const droppingStop = stopBySeq(booking.droppingStopSequence) ?? stops[stops.length - 1];
+    const departureTime =
+      routeDoc?.schedule?.departures?.[booking.departureIndex]?.time ?? '';
+
+    // Minutes until the IST departure instant (departureDate + time are IST).
+    let minutesToDeparture: number | null = null;
+    if (/^\d{4}-\d{2}-\d{2}$/.test(booking.departureDate) && /^\d{2}:\d{2}$/.test(departureTime)) {
+      const targetMs = Date.parse(`${booking.departureDate}T${departureTime}:00+05:30`);
+      if (!Number.isNaN(targetMs)) {
+        minutesToDeparture = Math.round((targetMs - Date.now()) / 60000);
+      }
+    }
+
+    // Journey + driver.
+    const journey = booking.driver
+      ? await DriverJourney.findOne({
+          route: booking.route,
+          driver: booking.driver,
+          departureIndex: booking.departureIndex,
+          departureDate: booking.departureDate,
+        }).lean()
+      : null;
+    const journeyStatus = journey?.status ?? null;
+    const journeyActive = journeyStatus === 'active' || journeyStatus === 'in_progress';
+
+    let driverInfo: any = null;
+    let driverLocation: any = null;
+    if (booking.driver) {
+      const drv = await User.findById(booking.driver)
+        .select(
+          'firstName lastName avatar phone driverProfile.rating driverProfile.plateNumber ' +
+            'driverProfile.vehicleMake driverProfile.vehicleModel driverProfile.vehicleColor ' +
+            'driverProfile.currentLocation',
+        )
+        .lean();
+      if (drv) {
+        const dp: any = (drv as any).driverProfile ?? {};
+        driverInfo = {
+          id: String((drv as any)._id),
+          name: [(drv as any).firstName, (drv as any).lastName].filter(Boolean).join(' ') || 'Driver',
+          phone: (drv as any).phone ?? null,
+          avatar: (drv as any).avatar ?? null,
+          rating: dp.rating ?? null,
+          vehicle: {
+            make: dp.vehicleMake ?? '',
+            model: dp.vehicleModel ?? '',
+            color: dp.vehicleColor ?? '',
+            plateNumber: dp.plateNumber ?? '',
+          },
+        };
+        if (dp.currentLocation && typeof dp.currentLocation.lat === 'number') {
+          driverLocation = { lat: dp.currentLocation.lat, lng: dp.currentLocation.lng };
+        }
+      }
+    }
+
+    // Has the bus effectively arrived at the rider's boarding stop? (driver
+    // live GPS within ~350m of the boarding stop while the journey is running).
+    let atBoarding = false;
+    if (journeyActive && driverLocation && boardingStop) {
+      atBoarding =
+        distanceMeters(driverLocation, { lat: boardingStop.lat, lng: boardingStop.lng }) <= 350;
+    }
+
+    const boardedSet = new Set(booking.boardedSeats ?? []);
+    const boarded = (booking.seats ?? []).some((s) => boardedSet.has(s));
+
+    res.json({
+      success: true,
+      data: {
+        bookingId: String(booking._id),
+        status: booking.status,
+        routeId: String(booking.route),
+        routeName: routeDoc?.name ?? null,
+        boardingName: boardingStop?.name ?? null,
+        droppingName: droppingStop?.name ?? null,
+        departureDate: booking.departureDate,
+        departureTime,
+        minutesToDeparture,
+        seats: booking.seats ?? [],
+        journeyStatus,
+        journeyActive,
+        atBoarding,
+        boarded,
+        driver: driverInfo,
+        driverLocation,
+        earlyDrop: booking.earlyDrop ?? null,
+      },
+    });
+  } catch (error) {
+    console.error('getBookingStatus error:', error);
+    res.status(500).json({ success: false, message: 'Failed to load trip status' });
+  }
+};

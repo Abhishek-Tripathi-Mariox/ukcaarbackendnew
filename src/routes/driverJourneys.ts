@@ -740,6 +740,15 @@ async function boardSeats(
   await booking.save();
 
   const cust: any = booking.customer;
+  // Tell the rider their seat boarded so the onboarding hub advances to the
+  // "You've Boarded Successfully!" stage in real time.
+  try {
+    const custId = cust && cust._id ? cust._id : booking.customer;
+    emitToUser(String(custId), 'scheduled:boarded', {
+      bookingId: String(booking._id),
+      seats: booking.boardedSeats,
+    });
+  } catch { /* best-effort */ }
   return {
     ok: true,
     passenger: {
@@ -941,15 +950,18 @@ router.post('/:key/verify-qr', async (req: AuthRequest, res: Response) => {
     }
     const raw = req.body?.qr;
     let bookingId: string | undefined;
+    // The customer ticket QR carries { bookingId, ref, ... }; `ref` is the
+    // 8-char short code (or bookingId) shown on the ticket, matched by boardSeats
+    // even when it isn't a full ObjectId.
     if (typeof raw === 'string') {
       try {
         const obj = JSON.parse(raw);
-        bookingId = obj?.bookingId || obj?.id;
+        bookingId = obj?.bookingId || obj?.id || obj?.ref;
       } catch {
         bookingId = raw; // a bare bookingId string
       }
     } else if (raw && typeof raw === 'object') {
-      bookingId = raw.bookingId || raw.id;
+      bookingId = raw.bookingId || raw.id || raw.ref;
     }
     if (!bookingId) {
       res.status(400).json({ success: false, valid: false, message: 'Unreadable ticket' });

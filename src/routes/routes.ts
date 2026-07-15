@@ -12,6 +12,7 @@ import {
   requestEarlyDrop,
   cancelEarlyDrop,
   rateBooking,
+  getBookingStatus,
 } from '../controllers/routeController';
 
 /**
@@ -30,6 +31,7 @@ router.post('/bookings/:bookingId/cancel', cancelRouteBooking);
 router.post('/bookings/:bookingId/early-drop/request', requestEarlyDrop);
 router.post('/bookings/:bookingId/early-drop/cancel', cancelEarlyDrop);
 router.post('/bookings/:bookingId/rate', rateBooking);
+router.get('/bookings/:bookingId/status', getBookingStatus);
 router.get('/:id', getRouteById);
 router.get('/:id/vehicles', getRouteVehicles);
 router.get('/:id/seats', getRouteSeats);

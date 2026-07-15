@@ -223,15 +223,17 @@ export const createOrder = async (req: AuthRequest, res: Response): Promise<void
       chargeAmount = quote.total;
       walletCredit = quote.walletCredit;
       bonusAmount = quote.bonus;
-    } else if (type === 'ride_payment') {
-      // NEVER trust the client's amount for a ride — derive it from the ride
-      // itself. Previously any rider could create a ₹1 order for a ₹500 ride
-      // and verify-payment would settle the full fare. Also enforce ownership
-      // and that the ride is actually awaiting payment.
-      if (!rideId) {
-        res.status(400).json({ success: false, message: 'rideId is required' });
-        return;
-      }
+    } else if (type === 'ride_payment' && rideId) {
+      // Secure ride payment: NEVER trust the client's amount — derive it from
+      // the ride itself (previously any rider could create a ₹1 order for a
+      // ₹500 ride and verify-payment would settle the full fare). Also enforce
+      // ownership + that the ride is awaiting payment.
+      //
+      // NOTE: a 'ride_payment' WITHOUT a rideId (the scheduled-booking Razorpay
+      // path historically reuses this type) intentionally falls through to the
+      // generic client-amount handling below — it has no ride attached, so
+      // verify-payment can't settle any ride from it and there's nothing to
+      // exploit. This keeps scheduled Razorpay payments working.
       const ride = await Ride.findById(rideId);
       if (!ride) {
         res.status(404).json({ success: false, message: 'Ride not found' });

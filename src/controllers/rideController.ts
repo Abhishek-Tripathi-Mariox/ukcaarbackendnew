@@ -1881,7 +1881,12 @@ export const rateRide = async (req: AuthRequest, res: Response): Promise<void> =
     const { rating, comment, tags, tip } = req.body;
     const ride = await Ride.findById(req.params.id);
 
-    if (!ride || ride.status !== 'completed') {
+    // A rating is about the TRIP experience, so it's allowed as soon as the
+    // trip has physically ended — `payment_pending` (driver pressed End Trip)
+    // or `completed`. Requiring `completed` meant a cash ride (the default
+    // payment method) could never be rated until the driver confirmed cash,
+    // which the rider's rating almost always raced ahead of → "not completed".
+    if (!ride || !['completed', 'payment_pending'].includes(ride.status)) {
       res.status(400).json({ success: false, message: 'Ride not found or not completed' });
       return;
     }
@@ -1926,8 +1931,6 @@ export const rateRide = async (req: AuthRequest, res: Response): Promise<void> =
           return;
         }
         ride.tip = tipAmt;
-        ride.driverEarnings = (ride.driverEarnings || 0) + tipAmt;
-        await ride.save();
 
         await Payment.create({
           user: ride.customer,
@@ -1939,7 +1942,13 @@ export const rateRide = async (req: AuthRequest, res: Response): Promise<void> =
           description: 'Driver tip',
         });
 
-        if (ride.driver) {
+        // Credit the driver directly ONLY if settlement has already run
+        // (ride completed). If the ride is still payment_pending, leave the
+        // driver side to finalizeRideSettlement — it computes driverEarnings as
+        // actualFare − commission + ride.tip and credits the wallet, so
+        // crediting here too would double-pay the tip.
+        if (ride.status === 'completed' && ride.driver) {
+          ride.driverEarnings = (ride.driverEarnings || 0) + tipAmt;
           await Wallet.findOneAndUpdate(
             { user: ride.driver },
             { $inc: { balance: tipAmt } },
@@ -1958,18 +1967,26 @@ export const rateRide = async (req: AuthRequest, res: Response): Promise<void> =
             description: 'Tip received',
           });
         }
+        await ride.save();
       }
 
-      // Update driver rating (running average)
+      // Update driver rating (running average). Include the current rating —
+      // this ride isn't saved yet, so the query alone would omit it — and guard
+      // the divide so a driver's FIRST rating doesn't compute 0/0 = NaN (which
+      // could throw when written to the Number `driverProfile.rating`, showing
+      // up to the rider as "rating failed").
       if (ride.driver) {
         const driverRides = await Ride.find({
           driver: ride.driver,
-          'rating.customerToDriver': { $exists: true },
+          _id: { $ne: ride._id },
+          'rating.customerToDriver': { $gt: 0 },
         }).select('rating.customerToDriver');
 
-        const avgRating =
-          driverRides.reduce((sum, r) => sum + (r.rating?.customerToDriver || 0), 0) /
-          driverRides.length;
+        const scores = driverRides
+          .map(r => r.rating?.customerToDriver || 0)
+          .filter(n => n > 0);
+        scores.push(rating);
+        const avgRating = scores.reduce((sum, n) => sum + n, 0) / scores.length;
 
         await User.findByIdAndUpdate(ride.driver, {
           'driverProfile.rating': Math.round(avgRating * 100) / 100,

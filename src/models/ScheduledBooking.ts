@@ -53,8 +53,42 @@ export interface IScheduledBooking extends Document {
    *  so this does NOT affect settlement — it's an operational record so admin/
    *  history can see the early drop. */
   droppedSeats?: number[];
+  /** 0-based `sequence` of the stop the rider boards at / is booked to drop at.
+   *  Captured at booking so an early-drop can recompute the partial fare for the
+   *  segment actually travelled (boarding → drop point) vs the booked segment
+   *  (boarding → dropping). Absent on legacy rows booked before this existed —
+   *  the early-drop math falls back to the whole-route span in that case. */
+  boardingStopSequence?: number;
+  droppingStopSequence?: number;
+  /** Total refunded to the rider across all early-drops on this booking. The
+   *  driver's settlement earns on `totalAmount - refundedAmount` so the platform
+   *  and driver aren't paid for the unridden portion the rider got money back
+   *  for. */
+  refundedAmount?: number;
+  /** Customer-requested early-drop lifecycle (the "Emergency → Need to Stop
+   *  Mid-Route" flow). The rider REQUESTS from the tracking screen; the driver
+   *  APPROVES (or declines) from the Emergency Alert screen. On approval the
+   *  partial fare is recomputed and the difference refunded. */
+  earlyDrop?: {
+    status: 'requested' | 'approved' | 'declined' | 'cancelled';
+    reason?: string;
+    requestedAt?: Date;
+    decidedAt?: Date;
+    /** `sequence` of the stop the bus actually dropped the rider at. */
+    dropStopSequence?: number;
+    /** Fare the rider originally paid for their booked segment. */
+    originalFare?: number;
+    /** Recomputed fare for the distance actually covered. */
+    partialFare?: number;
+    /** originalFare − partialFare, credited back (wallet) or queued (razorpay). */
+    refund?: number;
+  };
   /** First time any seat on this booking boarded. */
   boardedAt?: Date;
+  /** Rider's post-trip rating (1–5) + optional written feedback, captured on the
+   *  "How Was Your Ride?" screen after an early drop or completed shuttle trip. */
+  rating?: number;
+  feedback?: string;
   /** Who cancelled the seat and why. Populated on cancel so admin/customer
    *  history can show the same "cancelled by + reason" detail that Ride
    *  records carry. */
@@ -107,7 +141,22 @@ const scheduledBookingSchema = new Schema<IScheduledBooking>(
     boardedSeats: { type: [Number], default: [] },
     noShowSeats: { type: [Number], default: [] },
     droppedSeats: { type: [Number], default: [] },
+    boardingStopSequence: { type: Number, min: 0 },
+    droppingStopSequence: { type: Number, min: 0 },
+    refundedAmount: { type: Number, default: 0, min: 0 },
+    earlyDrop: {
+      status: { type: String, enum: ['requested', 'approved', 'declined', 'cancelled'] },
+      reason: String,
+      requestedAt: Date,
+      decidedAt: Date,
+      dropStopSequence: { type: Number, min: 0 },
+      originalFare: { type: Number, min: 0 },
+      partialFare: { type: Number, min: 0 },
+      refund: { type: Number, min: 0 },
+    },
     boardedAt: { type: Date },
+    rating: { type: Number, min: 1, max: 5 },
+    feedback: { type: String, trim: true },
     cancellation: {
       cancelledBy: { type: String, enum: ['customer', 'driver', 'admin', 'system'] },
       reason: String,

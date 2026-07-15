@@ -3,6 +3,7 @@ import { Route } from '../models';
 import { AuthRequest } from '../middleware/auth';
 import { distanceMeters } from '../utils/routeCorridor';
 import { istDateStr, istDateStrPlusDays, istMinutesOfDay } from '../utils/date';
+import { emitToUser } from '../socket';
 
 /**
  * Driver and customer-facing route endpoints. The admin already has full
@@ -758,7 +759,7 @@ export const bookRouteSeats = async (
     const { id } = req.params;
     const {
       departureDate, departureIndex, seats, totalAmount, driverId, passengers,
-      paymentMethod,
+      paymentMethod, boardingStopSequence, droppingStopSequence,
     } = req.body ?? {};
 
     if (!driverId || typeof driverId !== 'string') {
@@ -920,6 +921,15 @@ export const bookRouteSeats = async (
         totalAmount: amount,
         // Recorded so cancellation knows whether to auto-refund the wallet.
         paymentMethod: paymentMethod === 'wallet' ? 'wallet' : 'razorpay',
+        // Booked segment (stop `sequence` values) — powers the early-drop
+        // partial-fare recompute. Only stored when the client sends valid
+        // numbers; legacy/absent falls back to whole-route span at drop time.
+        ...(Number.isInteger(boardingStopSequence) && boardingStopSequence >= 0
+          ? { boardingStopSequence }
+          : {}),
+        ...(Number.isInteger(droppingStopSequence) && droppingStopSequence >= 0
+          ? { droppingStopSequence }
+          : {}),
       });
     } catch (createErr) {
       // Booking failed after we took the money — refund the debit so the
@@ -1054,5 +1064,225 @@ export const cancelRouteBooking = async (
   } catch (error) {
     console.error('cancelRouteBooking error:', error);
     res.status(500).json({ success: false, message: 'Failed to cancel booking' });
+  }
+};
+
+/**
+ * POST /api/v1/routes/bookings/:bookingId/early-drop/request
+ *
+ * The rider — riding an active scheduled shuttle — asks to be let off before
+ * their booked stop ("Emergency → Need to Stop Mid-Route" in the app). This
+ * only RECORDS the request and pings the driver; the driver approves from the
+ * Emergency Alert screen, and only THEN is the partial fare recomputed and the
+ * difference refunded. Customer-initiated, driver-approved — matching the
+ * Figma onboarding flow.
+ */
+export const requestEarlyDrop = async (
+  req: AuthRequest,
+  res: Response,
+): Promise<void> => {
+  try {
+    const cleanId = String(req.params.bookingId).replace(/^sched_/, '');
+    const { ScheduledBooking, DriverJourney } = await import('../models');
+    const booking = await ScheduledBooking.findById(cleanId).populate(
+      'customer',
+      'firstName lastName phone',
+    );
+    if (!booking) {
+      res.status(404).json({ success: false, message: 'Booking not found' });
+      return;
+    }
+    const customerId =
+      (booking.customer as any)?._id ?? booking.customer;
+    if (String(customerId) !== String(req.user!._id)) {
+      res.status(403).json({ success: false, message: 'Not your booking' });
+      return;
+    }
+    if (booking.status !== 'reserved') {
+      res.status(400).json({
+        success: false,
+        message: 'This booking is not active.',
+      });
+      return;
+    }
+    // Already decided / mid-flight guards keep the request idempotent so a
+    // double-tap or a retry never opens a second request or errors the client.
+    const ed = booking.earlyDrop;
+    if (ed?.status === 'approved') {
+      res.status(200).json({
+        success: true,
+        message: 'Your early drop was already approved.',
+        data: { status: 'approved', earlyDrop: ed },
+      });
+      return;
+    }
+    if (ed?.status === 'requested') {
+      res.status(200).json({
+        success: true,
+        message: 'Your request is awaiting driver approval.',
+        data: { status: 'requested', earlyDrop: ed },
+      });
+      return;
+    }
+
+    // The trip must actually be under way — you can only ask to get off a bus
+    // you're on. "Under way" = the driver's journey is active/in_progress OR
+    // the rider has a boarded seat.
+    if (!booking.driver) {
+      res.status(400).json({ success: false, message: 'No driver is assigned to this trip yet.' });
+      return;
+    }
+    const journey = await DriverJourney.findOne({
+      route: booking.route,
+      driver: booking.driver,
+      departureIndex: booking.departureIndex,
+      departureDate: booking.departureDate,
+    }).lean();
+    const journeyActive =
+      journey?.status === 'active' || journey?.status === 'in_progress';
+    const hasBoarded = (booking.boardedSeats?.length ?? 0) > 0;
+    if (!journeyActive && !hasBoarded) {
+      res.status(400).json({
+        success: false,
+        message: 'Your trip hasn’t started yet. You can request an early drop once you’re on board.',
+      });
+      return;
+    }
+
+    const reason =
+      typeof req.body?.reason === 'string' && req.body.reason.trim()
+        ? req.body.reason.trim()
+        : 'Early drop requested';
+    booking.earlyDrop = {
+      status: 'requested',
+      reason,
+      requestedAt: new Date(),
+    };
+    await booking.save();
+
+    // Notify the specific driver whose vehicle the rider is on — socket for a
+    // foregrounded app, push for a backgrounded one.
+    const cust: any = booking.customer;
+    const customerName =
+      [cust?.firstName, cust?.lastName].filter(Boolean).join(' ') || 'Passenger';
+    const payload = {
+      bookingId: String(booking._id),
+      customerName,
+      contact: cust?.phone ?? '',
+      seats: booking.seats ?? [],
+      reason,
+      routeId: String(booking.route),
+      departureIndex: booking.departureIndex,
+      departureDate: booking.departureDate,
+    };
+    try {
+      emitToUser(String(booking.driver), 'scheduled:early-drop-request', payload);
+    } catch { /* best-effort */ }
+    try {
+      const { sendPushToUser } = await import('./fcmController');
+      await sendPushToUser(String(booking.driver), {
+        title: 'Early drop requested',
+        body: `${customerName} (Seat ${(booking.seats ?? []).join(', ')}) is asking to get off early.`,
+        data: { kind: 'scheduled:early-drop-request', bookingId: String(booking._id) },
+      });
+    } catch { /* best-effort */ }
+
+    res.status(200).json({
+      success: true,
+      message: 'Request sent to your driver.',
+      data: { status: 'requested', earlyDrop: booking.earlyDrop },
+    });
+  } catch (error) {
+    console.error('requestEarlyDrop error:', error);
+    res.status(500).json({ success: false, message: 'Failed to send request' });
+  }
+};
+
+/**
+ * POST /api/v1/routes/bookings/:bookingId/early-drop/cancel
+ * The rider withdraws a still-pending early-drop request ("Cancel Request" on
+ * the waiting screen). No-op once the driver has already approved/declined.
+ */
+export const cancelEarlyDrop = async (
+  req: AuthRequest,
+  res: Response,
+): Promise<void> => {
+  try {
+    const cleanId = String(req.params.bookingId).replace(/^sched_/, '');
+    const { ScheduledBooking } = await import('../models');
+    const booking = await ScheduledBooking.findById(cleanId);
+    if (!booking) {
+      res.status(404).json({ success: false, message: 'Booking not found' });
+      return;
+    }
+    if (String(booking.customer) !== String(req.user!._id)) {
+      res.status(403).json({ success: false, message: 'Not your booking' });
+      return;
+    }
+    if (booking.earlyDrop?.status !== 'requested') {
+      // Nothing pending to cancel — treat as success so the UI just returns.
+      res.status(200).json({
+        success: true,
+        message: 'No pending request.',
+        data: { status: booking.earlyDrop?.status ?? null },
+      });
+      return;
+    }
+    booking.earlyDrop = {
+      ...booking.earlyDrop,
+      status: 'cancelled',
+      decidedAt: new Date(),
+    };
+    await booking.save();
+    if (booking.driver) {
+      try {
+        emitToUser(String(booking.driver), 'scheduled:early-drop-cancelled', {
+          bookingId: String(booking._id),
+        });
+      } catch { /* best-effort */ }
+    }
+    res.status(200).json({ success: true, message: 'Request cancelled', data: { status: 'cancelled' } });
+  } catch (error) {
+    console.error('cancelEarlyDrop error:', error);
+    res.status(500).json({ success: false, message: 'Failed to cancel request' });
+  }
+};
+
+/**
+ * POST /api/v1/routes/bookings/:bookingId/rate
+ * Body: { rating: 1..5, feedback? }
+ * Rider's post-trip feedback for a scheduled-shuttle booking (the "How Was Your
+ * Ride?" screen). Stored on the booking; shuttle bookings have no Ride doc so
+ * this is a separate path from the instant-ride rateRide.
+ */
+export const rateBooking = async (
+  req: AuthRequest,
+  res: Response,
+): Promise<void> => {
+  try {
+    const cleanId = String(req.params.bookingId).replace(/^sched_/, '');
+    const rating = Number(req.body?.rating);
+    if (!Number.isFinite(rating) || rating < 1 || rating > 5) {
+      res.status(400).json({ success: false, message: 'rating must be 1–5' });
+      return;
+    }
+    const { ScheduledBooking } = await import('../models');
+    const booking = await ScheduledBooking.findById(cleanId);
+    if (!booking) {
+      res.status(404).json({ success: false, message: 'Booking not found' });
+      return;
+    }
+    if (String(booking.customer) !== String(req.user!._id)) {
+      res.status(403).json({ success: false, message: 'Not your booking' });
+      return;
+    }
+    booking.rating = Math.round(rating);
+    const fb = typeof req.body?.feedback === 'string' ? req.body.feedback.trim() : '';
+    if (fb) booking.feedback = fb;
+    await booking.save();
+    res.status(200).json({ success: true, message: 'Thanks for your feedback' });
+  } catch (error) {
+    console.error('rateBooking error:', error);
+    res.status(500).json({ success: false, message: 'Failed to save feedback' });
   }
 };

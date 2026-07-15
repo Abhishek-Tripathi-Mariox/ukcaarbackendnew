@@ -5,6 +5,7 @@ import {
   ScheduledBooking,
   DriverJourney,
   IDriverJourney,
+  User,
   Wallet,
   Payment,
   Settings,
@@ -12,6 +13,7 @@ import {
 import { authenticate, authorize, AuthRequest } from '../middleware/auth';
 import { config } from '../config';
 import { emitToUser } from '../socket';
+import { distanceMeters } from '../utils/routeCorridor';
 import { istDateStr, istWeekday, istDateStrPlusDays } from '../utils/date';
 
 const router = Router();
@@ -103,6 +105,336 @@ async function shapeJourney(
     earnings: journey?.earnings ?? 0,
   };
 }
+
+// ── Early-drop partial-fare math ──
+// A rider who gets off before their booked stop is refunded the fare for the
+// distance they DIDN'T travel. We measure how far the bus actually carried them
+// and prorate `totalAmount` over that. "How far" is derived, most-reliable
+// first: (1) the stop nearest the driver's live GPS, (2) the journey's current
+// stop, (3) a 50/50 split when neither signal exists. Fare is weighted by the
+// route's per-segment `fareFromPrevious` when configured, else by geographic
+// distance between stops.
+function computeEarlyDropFare(
+  routeDoc: any,
+  booking: any,
+  driverLoc: { lat: number; lng: number } | null,
+  journey: any,
+): { originalFare: number; partialFare: number; refund: number; dropStopSequence: number; dropStopName: string } {
+  const originalFare = Math.max(0, Math.round(Number(booking.totalAmount) || 0));
+  const stops = [...(routeDoc?.stops ?? [])].sort(
+    (a: any, b: any) => (a.sequence ?? 0) - (b.sequence ?? 0),
+  );
+  const seqOf = (s: any) => s.sequence ?? 0;
+  if (stops.length < 2) {
+    return { originalFare, partialFare: originalFare, refund: 0, dropStopSequence: 0, dropStopName: '' };
+  }
+  const minSeq = seqOf(stops[0]);
+  const maxSeq = seqOf(stops[stops.length - 1]);
+  const clamp = (v: number, lo: number, hi: number) => Math.max(lo, Math.min(v, hi));
+  const bSeq = clamp(
+    Number.isInteger(booking.boardingStopSequence) ? booking.boardingStopSequence : minSeq,
+    minSeq,
+    maxSeq,
+  );
+  const dSeq = clamp(
+    Number.isInteger(booking.droppingStopSequence) ? booking.droppingStopSequence : maxSeq,
+    bSeq,
+    maxSeq,
+  );
+  const nameOf = (seq: number) => stops.find((s: any) => seqOf(s) === seq)?.name ?? '';
+  if (dSeq <= bSeq || originalFare <= 0) {
+    return { originalFare, partialFare: originalFare, refund: 0, dropStopSequence: dSeq, dropStopName: nameOf(dSeq) };
+  }
+
+  const inSegment = stops.filter((s: any) => seqOf(s) >= bSeq && seqOf(s) <= dSeq);
+
+  // Where did the bus drop them?
+  let dropSeq: number | null = null;
+  if (driverLoc && typeof driverLoc.lat === 'number' && typeof driverLoc.lng === 'number') {
+    let best: { seq: number; m: number } | null = null;
+    for (const s of inSegment) {
+      const m = distanceMeters(driverLoc, { lat: s.lat, lng: s.lng });
+      if (!best || m < best.m) best = { seq: seqOf(s), m };
+    }
+    if (best) dropSeq = best.seq;
+  }
+  if (dropSeq == null && journey && Number.isInteger(journey.currentStopIndex)) {
+    const cs = routeDoc?.stops?.[journey.currentStopIndex];
+    if (cs) dropSeq = clamp(seqOf(cs), bSeq, dSeq);
+  }
+
+  const fareBetween = (from: number, to: number) =>
+    stops
+      .filter((s: any) => seqOf(s) > from && seqOf(s) <= to)
+      .reduce((sum: number, s: any) => sum + (s.fareFromPrevious ?? 0), 0);
+  const distBetween = (from: number, to: number) => {
+    const seg = stops.filter((s: any) => seqOf(s) >= from && seqOf(s) <= to);
+    let d = 0;
+    for (let i = 1; i < seg.length; i++) {
+      d += distanceMeters(
+        { lat: seg[i - 1].lat, lng: seg[i - 1].lng },
+        { lat: seg[i].lat, lng: seg[i].lng },
+      );
+    }
+    return d;
+  };
+
+  let fraction: number;
+  if (dropSeq == null) {
+    fraction = 0.5; // no position signal — split the fare fairly
+  } else {
+    dropSeq = clamp(dropSeq, bSeq, dSeq);
+    const totalFare = fareBetween(bSeq, dSeq);
+    if (totalFare > 0) {
+      fraction = fareBetween(bSeq, dropSeq) / totalFare;
+    } else {
+      const totalD = distBetween(bSeq, dSeq);
+      fraction = totalD > 0 ? distBetween(bSeq, dropSeq) / totalD : 0.5;
+    }
+  }
+  fraction = clamp(fraction, 0, 1);
+  const partialFare = Math.round(originalFare * fraction);
+  const refund = clamp(originalFare - partialFare, 0, originalFare);
+  const finalDropSeq = dropSeq ?? bSeq;
+  return { originalFare, partialFare, refund, dropStopSequence: finalDropSeq, dropStopName: nameOf(finalDropSeq) };
+}
+
+/** The customer id on a booking, whether or not `customer` is populated. */
+function bookingCustomerId(booking: any): string {
+  const c = booking.customer;
+  return String(c && c._id ? c._id : c);
+}
+
+/**
+ * POST /api/v1/drivers/journeys/early-drop/:bookingId/approve
+ *
+ * The driver approves a rider's pending early-drop request (from the Emergency
+ * Alert screen). Recomputes the partial fare for the distance actually covered,
+ * refunds the difference (wallet auto-credit; razorpay queued for support), and
+ * records the drop. Idempotent + atomic so a double-tap can't double-refund.
+ */
+router.post('/early-drop/:bookingId/approve', async (req: AuthRequest, res: Response) => {
+  try {
+    const cleanId = String(req.params.bookingId).replace(/^sched_/, '');
+    if (!mongoose.isValidObjectId(cleanId)) {
+      res.status(400).json({ success: false, message: 'Invalid booking' });
+      return;
+    }
+    const booking = await ScheduledBooking.findById(cleanId).populate(
+      'customer',
+      'firstName lastName phone',
+    );
+    if (!booking) {
+      res.status(404).json({ success: false, message: 'Booking not found' });
+      return;
+    }
+    if (String(booking.driver) !== String(req.user!._id)) {
+      res.status(403).json({ success: false, message: 'This passenger is not on your vehicle' });
+      return;
+    }
+    if (booking.earlyDrop?.status === 'approved') {
+      res.json({ success: true, data: { earlyDrop: booking.earlyDrop, alreadyApproved: true } });
+      return;
+    }
+    if (booking.earlyDrop?.status !== 'requested') {
+      res.status(400).json({ success: false, message: 'No pending early-drop request for this passenger' });
+      return;
+    }
+    if (booking.status !== 'reserved') {
+      res.status(400).json({ success: false, message: 'This booking is not active' });
+      return;
+    }
+
+    const routeDoc = await Route.findById(booking.route).lean();
+    const driverUser = await User.findById(req.user!._id)
+      .select('driverProfile.currentLocation')
+      .lean();
+    const driverLoc = (driverUser as any)?.driverProfile?.currentLocation ?? null;
+    const journey = await DriverJourney.findOne({
+      route: booking.route,
+      driver: booking.driver,
+      departureIndex: booking.departureIndex,
+      departureDate: booking.departureDate,
+    }).lean();
+
+    const fare = computeEarlyDropFare(routeDoc, booking, driverLoc, journey);
+
+    // Atomic claim — only the first approve while status is still 'requested'
+    // wins, so the refund below runs exactly once.
+    const claimed = await ScheduledBooking.findOneAndUpdate(
+      { _id: booking._id, 'earlyDrop.status': 'requested' },
+      {
+        $set: {
+          'earlyDrop.status': 'approved',
+          'earlyDrop.decidedAt': new Date(),
+          'earlyDrop.dropStopSequence': fare.dropStopSequence,
+          'earlyDrop.originalFare': fare.originalFare,
+          'earlyDrop.partialFare': fare.partialFare,
+          'earlyDrop.refund': fare.refund,
+        },
+        $inc: { refundedAmount: fare.refund },
+        $addToSet: { droppedSeats: { $each: booking.seats ?? [] } },
+      },
+      { new: true },
+    );
+    if (!claimed) {
+      const fresh = await ScheduledBooking.findById(booking._id).lean();
+      res.json({ success: true, data: { earlyDrop: fresh?.earlyDrop, alreadyApproved: true } });
+      return;
+    }
+
+    const customerId = bookingCustomerId(booking);
+
+    // Refund the unridden portion. Wallet is credited immediately; a card/UPI
+    // (razorpay) payment is queued as a pending refund for support to push back
+    // to the original method (matches the app's cancel-refund policy).
+    if (fare.refund > 0) {
+      if (booking.paymentMethod === 'wallet') {
+        await Wallet.findOneAndUpdate(
+          { user: customerId },
+          { $inc: { balance: fare.refund } },
+          { upsert: true },
+        );
+        await Payment.create({
+          user: customerId,
+          type: 'refund',
+          amount: fare.refund,
+          method: 'wallet',
+          status: 'completed',
+          description: `Early-drop refund — partial fare ₹${fare.partialFare} of ₹${fare.originalFare}`,
+        }).catch((e) => console.warn('[early-drop] refund statement failed:', e));
+      } else {
+        await Payment.create({
+          user: customerId,
+          type: 'refund',
+          amount: fare.refund,
+          method: 'card',
+          status: 'pending',
+          description: `Early-drop refund (pending to original payment method) — partial fare ₹${fare.partialFare} of ₹${fare.originalFare}`,
+        }).catch((e) => console.warn('[early-drop] pending refund failed:', e));
+      }
+    }
+
+    const summary = {
+      bookingId: String(booking._id),
+      originalFare: fare.originalFare,
+      partialFare: fare.partialFare,
+      refund: fare.refund,
+      refundMethod: booking.paymentMethod === 'wallet' ? 'wallet' : 'original',
+      dropStopName: fare.dropStopName,
+      droppedAt: new Date().toISOString(),
+    };
+    try {
+      emitToUser(customerId, 'scheduled:early-drop-approved', summary);
+    } catch { /* best-effort */ }
+    try {
+      const { sendPushToUser } = await import('../controllers/fcmController');
+      await sendPushToUser(customerId, {
+        title: 'Early drop approved',
+        body: fare.refund > 0
+          ? `The driver will stop at the next safe point. ₹${fare.refund} will be refunded.`
+          : 'The driver will stop at the next safe point.',
+        data: { kind: 'scheduled:early-drop-approved', bookingId: String(booking._id) },
+      });
+    } catch { /* best-effort */ }
+
+    res.json({ success: true, data: { earlyDrop: claimed.earlyDrop, ...summary } });
+  } catch (err) {
+    console.error('[early-drop approve] error:', err);
+    res.status(500).json({ success: false, message: 'Failed to approve early drop' });
+  }
+});
+
+/**
+ * POST /api/v1/drivers/journeys/early-drop/:bookingId/decline
+ * The driver can't safely stop — decline the request. The rider stays on to
+ * their booked stop; no fare change.
+ */
+router.post('/early-drop/:bookingId/decline', async (req: AuthRequest, res: Response) => {
+  try {
+    const cleanId = String(req.params.bookingId).replace(/^sched_/, '');
+    if (!mongoose.isValidObjectId(cleanId)) {
+      res.status(400).json({ success: false, message: 'Invalid booking' });
+      return;
+    }
+    const booking = await ScheduledBooking.findById(cleanId);
+    if (!booking) {
+      res.status(404).json({ success: false, message: 'Booking not found' });
+      return;
+    }
+    if (String(booking.driver) !== String(req.user!._id)) {
+      res.status(403).json({ success: false, message: 'This passenger is not on your vehicle' });
+      return;
+    }
+    if (booking.earlyDrop?.status !== 'requested') {
+      res.status(200).json({ success: true, data: { status: booking.earlyDrop?.status ?? null } });
+      return;
+    }
+    const reason =
+      typeof req.body?.reason === 'string' && req.body.reason.trim()
+        ? req.body.reason.trim()
+        : 'Not safe to stop here';
+    booking.earlyDrop = {
+      ...booking.earlyDrop,
+      status: 'declined',
+      reason,
+      decidedAt: new Date(),
+    };
+    await booking.save();
+    const customerId = bookingCustomerId(booking);
+    try {
+      emitToUser(customerId, 'scheduled:early-drop-declined', {
+        bookingId: String(booking._id),
+        reason,
+      });
+    } catch { /* best-effort */ }
+    try {
+      const { sendPushToUser } = await import('../controllers/fcmController');
+      await sendPushToUser(customerId, {
+        title: 'Early drop not possible right now',
+        body: reason,
+        data: { kind: 'scheduled:early-drop-declined', bookingId: String(booking._id) },
+      });
+    } catch { /* best-effort */ }
+    res.json({ success: true, data: { status: 'declined', reason } });
+  } catch (err) {
+    console.error('[early-drop decline] error:', err);
+    res.status(500).json({ success: false, message: 'Failed to decline early drop' });
+  }
+});
+
+/**
+ * GET /api/v1/drivers/journeys/early-drop/pending
+ * Any early-drop requests currently awaiting THIS driver's approval. The app
+ * calls this on resume so a request that arrived while backgrounded isn't lost.
+ */
+router.get('/early-drop/pending', async (req: AuthRequest, res: Response) => {
+  try {
+    const bookings = await ScheduledBooking.find({
+      driver: req.user!._id,
+      status: 'reserved',
+      'earlyDrop.status': 'requested',
+    })
+      .populate('customer', 'firstName lastName phone')
+      .lean();
+    const requests = bookings.map((b: any) => ({
+      bookingId: String(b._id),
+      customerName:
+        [b.customer?.firstName, b.customer?.lastName].filter(Boolean).join(' ') || 'Passenger',
+      contact: b.customer?.phone ?? '',
+      seats: b.seats ?? [],
+      reason: b.earlyDrop?.reason ?? '',
+      routeId: String(b.route),
+      departureIndex: b.departureIndex,
+      departureDate: b.departureDate,
+      requestedAt: b.earlyDrop?.requestedAt ?? null,
+    }));
+    res.json({ success: true, data: { requests } });
+  } catch (err) {
+    console.error('[early-drop pending] error:', err);
+    res.status(500).json({ success: false, message: 'Failed to load requests' });
+  }
+});
 
 /**
  * GET /api/v1/drivers/journeys?scope=upcoming|past
@@ -711,16 +1043,19 @@ router.post('/:key/complete', async (req: AuthRequest, res: Response) => {
       status: 'reserved',
     }).lean();
 
-    // Gross = the paid amount attributable to boarded seats. If a booking has
-    // no per-seat split we prorate totalAmount across its seats.
+    // Gross = the paid amount attributable to boarded seats, MINUS anything
+    // already refunded to the rider on an early drop (the driver shouldn't earn
+    // on distance the rider got money back for). If a booking has no per-seat
+    // split we prorate the net amount across its seats.
     let gross = 0;
     let boardedSeatCount = 0;
     for (const b of bookings) {
       const seats = b.seats?.length ?? 0;
       const boarded = (b.boardedSeats ?? []).length;
       boardedSeatCount += boarded;
-      if (seats > 0 && b.totalAmount) {
-        gross += (b.totalAmount / seats) * boarded;
+      const net = Math.max(0, (b.totalAmount ?? 0) - (b.refundedAmount ?? 0));
+      if (seats > 0 && net > 0) {
+        gross += (net / seats) * boarded;
       }
     }
     gross = Math.round(gross * 100) / 100;

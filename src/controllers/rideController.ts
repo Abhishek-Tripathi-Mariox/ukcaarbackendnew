@@ -1165,11 +1165,47 @@ export const getRides = async (req: AuthRequest, res: Response): Promise<void> =
               path: 'route',
               select: 'name stops schedule',
             })
+            .populate(
+              'driver',
+              'firstName lastName avatar phone driverProfile.rating driverProfile.plateNumber ' +
+                'driverProfile.vehicleMake driverProfile.vehicleModel driverProfile.vehicleColor',
+            )
             .sort({ createdAt: -1 })
             .lean()
         : Promise.resolve([] as any[]),
       includeBookings ? ScheduledBooking.countDocuments(bookingFilter) : Promise.resolve(0),
     ]);
+
+    // Which of the reserved bookings belong to a shuttle that's actually
+    // running right now? Load the matching DriverJourney for each and treat
+    // active/in_progress as "live". This is what lets an active scheduled ride
+    // surface in the customer's Active tab and become trackable — a plain
+    // `reserved` booking otherwise looks identical whether the bus left an hour
+    // ago or departs next week.
+    const { DriverJourney } = await import('../models');
+    const journeyKeyOf = (routeId: any, idx: number, date: string) =>
+      `${String(routeId)}_${idx}_${date}`;
+    const reserved = (bookings as any[]).filter(
+      (b) => b.status === 'reserved' && b.driver && b.route?._id,
+    );
+    const journeyStatusByKey = new Map<string, string>();
+    if (reserved.length > 0) {
+      const or = reserved.map((b) => ({
+        route: b.route._id,
+        driver: (b.driver as any)?._id ?? b.driver,
+        departureIndex: b.departureIndex,
+        departureDate: b.departureDate,
+      }));
+      const journeys = await DriverJourney.find({ $or: or })
+        .select('route driver departureIndex departureDate status')
+        .lean();
+      for (const j of journeys) {
+        journeyStatusByKey.set(
+          journeyKeyOf(j.route, j.departureIndex, j.departureDate),
+          j.status,
+        );
+      }
+    }
 
     // Project each ScheduledBooking → the Ride shape the customer
     // RideHistoryScreen renders. `_id` is prefixed `sched_<id>` so the
@@ -1177,20 +1213,46 @@ export const getRides = async (req: AuthRequest, res: Response): Promise<void> =
     // can route booking taps to ScheduledBookingDetails instead of the
     // ride flow.
     const projected = (bookings as any[]).map((b: any) => {
-      const stops = b.route?.stops ?? [];
-      const first = stops[b.pickupIndex ?? 0] ?? stops[0];
-      const last = stops[b.dropIndex ?? stops.length - 1] ?? stops[stops.length - 1];
+      const stops = [...(b.route?.stops ?? [])].sort(
+        (x: any, y: any) => (x.sequence ?? 0) - (y.sequence ?? 0),
+      );
+      const stopBySeq = (seq?: number) =>
+        typeof seq === 'number' ? stops.find((s: any) => (s.sequence ?? 0) === seq) : undefined;
+      // Prefer the rider's booked boarding/dropping stops; fall back to the
+      // route's first/last stop for legacy bookings without a stored segment.
+      const first = stopBySeq(b.boardingStopSequence) ?? stops[0];
+      const last = stopBySeq(b.droppingStopSequence) ?? stops[stops.length - 1];
       const slot = b.route?.schedule?.departures?.[b.departureIndex];
+
+      const drv: any = b.driver && (b.driver as any)._id ? b.driver : null;
+      const dp = drv?.driverProfile ?? {};
+      const jKey = b.route?._id
+        ? journeyKeyOf(b.route._id, b.departureIndex, b.departureDate)
+        : null;
+      const jStatus = jKey ? journeyStatusByKey.get(jKey) : undefined;
+      const hasBoarded = (b.boardedSeats?.length ?? 0) > 0;
+      // Live iff still reserved AND (the driver's journey is running OR the
+      // rider already boarded) AND they haven't already been dropped early. An
+      // APPROVED early-drop means the rider has left the bus, so it stops being
+      // "live"; a declined one keeps them on to their booked stop.
+      const isActiveNow =
+        b.status === 'reserved' &&
+        b.earlyDrop?.status !== 'approved' &&
+        (jStatus === 'active' || jStatus === 'in_progress' || hasBoarded);
+
       return {
         _id: `sched_${b._id}`,
         rideType: 'scheduled',
         isScheduled: true,
+        isActiveNow,
         status:
           b.status === 'cancelled'
             ? 'cancelled'
             : b.status === 'completed'
               ? 'completed'
-              : 'driver_assigned',
+              : isActiveNow
+                ? 'in_progress'
+                : 'driver_assigned',
         pickup: first
           ? {
               address: first.name ?? first.address ?? 'Stop 1',
@@ -1213,9 +1275,21 @@ export const getRides = async (req: AuthRequest, res: Response): Promise<void> =
         discount: 0,
         estimatedDistance: 0,
         estimatedDuration: 0,
-        paymentMethod: 'card',
+        paymentMethod: b.paymentMethod === 'wallet' ? 'wallet' : 'card',
         createdAt: b.createdAt,
-        // Booking-specific metadata so the Activity card / details
+        // Populated driver so the tracking card can show name/vehicle/rating
+        // without a follow-up call (kept as the top-level `driver` for parity
+        // with real rides, which RideHistory/RatingSheet already read).
+        driver: drv
+          ? {
+              _id: String(drv._id),
+              firstName: drv.firstName,
+              lastName: drv.lastName,
+              avatar: drv.avatar ?? null,
+              driverProfile: { rating: dp.rating ?? null },
+            }
+          : null,
+        // Booking-specific metadata so the Activity card / details / tracking
         // screen can render the right info without a follow-up call.
         booking: {
           id: String(b._id),
@@ -1226,7 +1300,28 @@ export const getRides = async (req: AuthRequest, res: Response): Promise<void> =
           departureTime: slot?.time ?? null,
           seats: b.seats ?? [],
           passengers: b.passengers ?? [],
-          driver: b.driver ?? null,
+          driver: (b.driver as any)?._id ? String((b.driver as any)._id) : (b.driver ?? null),
+          driverName: drv
+            ? [drv.firstName, drv.lastName].filter(Boolean).join(' ') || 'Driver'
+            : null,
+          driverPhone: drv?.phone ?? null,
+          driverRating: dp.rating ?? null,
+          vehicle: drv
+            ? {
+                make: dp.vehicleMake ?? '',
+                model: dp.vehicleModel ?? '',
+                color: dp.vehicleColor ?? '',
+                plateNumber: dp.plateNumber ?? '',
+              }
+            : null,
+          journeyKey: jKey,
+          journeyStatus: jStatus ?? null,
+          boardingStopSequence: b.boardingStopSequence ?? null,
+          droppingStopSequence: b.droppingStopSequence ?? null,
+          boardedSeats: b.boardedSeats ?? [],
+          droppedSeats: b.droppedSeats ?? [],
+          earlyDrop: b.earlyDrop ?? null,
+          refundedAmount: b.refundedAmount ?? 0,
         },
       };
     });

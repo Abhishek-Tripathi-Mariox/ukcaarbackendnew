@@ -1,6 +1,6 @@
 import { Router, Request, Response } from 'express';
 import mongoose from 'mongoose';
-import { User, Ride, Payment } from '../models';
+import { Notification, User, Ride, Payment } from '../models';
 import { authenticate, authorize, requirePermission } from '../middleware/auth';
 import { auditLog } from '../middleware/audit';
 import { PERMISSIONS } from '../config/permissions';
@@ -206,6 +206,12 @@ const approveHandler = async (req: Request, res: Response) => {
       body: "Congratulations! You're approved. Tap to start driving.",
       data: { kind: 'application:approved' },
     }).catch((e) => console.warn('[approve] push failed:', e));
+    await Notification.create({
+      user: driver._id,
+      title: 'You are approved! 🎉',
+      body: 'Your driver application has been approved. Go online to start receiving bookings.',
+      type: 'system',
+    }).catch(() => {});
     emitToUser(driver._id.toString(), 'application:approved', {
       message:
         'Congratulations! Your driver application has been approved. You can now go online and accept rides.',
@@ -233,10 +239,10 @@ const rejectHandler = async (req: Request, res: Response) => {
       { _id: req.params.id, role: 'driver' },
       {
         // Keep isVerified as-is (it just means phone OTP verified). Mark
-        // the application as rejected on the driverProfile instead.
-        isActive: false,
+        // the application as rejected on the driverProfile. Deliberately NOT
+        // isActive:false — that blocked OTP login outright, so a rejected
+        // driver could never sign in to fix and resubmit their documents.
         'driverProfile.registrationStep': 'rejected',
-        disabledAt: new Date(),
         disabledReason: `Application rejected: ${reason}`,
       },
       { new: true },
@@ -249,6 +255,17 @@ const rejectHandler = async (req: Request, res: Response) => {
       reason,
       message: `Your driver application was not approved. Reason: ${reason}`,
     });
+    sendPushToUser(driver._id.toString(), {
+      title: 'Application update',
+      body: `Your application was not approved: ${reason}. Fix your documents and resubmit.`,
+      data: { kind: 'document:rejected' },
+    }).catch((e) => console.warn('[reject] push failed:', e));
+    await Notification.create({
+      user: driver._id,
+      title: 'Application not approved',
+      body: `Reason: ${reason}. Update your documents from Profile → Documents and resubmit.`,
+      type: 'system',
+    }).catch(() => {});
     res.status(200).json({ success: true, message: 'Application rejected' });
   } catch (error) {
     res.status(500).json({ success: false, message: 'Rejection failed' });
@@ -433,6 +450,14 @@ router.patch(
       }
       docs[idx].status = normalized;
       driver.markModified('driverProfile.documents');
+      if (
+        normalized === 'rejected' &&
+        (driver.driverProfile as any).registrationStep === 'pending'
+      ) {
+        // Surface the rejection as an application-level state so the app
+        // flips from "waiting approval" to "fix your documents".
+        (driver.driverProfile as any).registrationStep = 'rejected';
+      }
       await driver.save();
 
       const niceType = req.params.documentType.replace(/-/g, ' ');
@@ -451,6 +476,12 @@ router.patch(
       // Out-of-band push too — driver may not have the app open. Verified is
       // a quiet status update; rejection is the actionable one.
       if (normalized === 'rejected') {
+        await Notification.create({
+          user: driver._id,
+          title: 'Document needs re-upload',
+          body: message,
+          type: 'system',
+        }).catch(() => {});
         sendPushToUser(driver._id.toString(), {
           title: 'Document needs re-upload',
           body: message,

@@ -53,7 +53,7 @@ export const uploadFile = async (req: AuthRequest, res: Response): Promise<void>
     // Generate unique filename. Driver registration docs go under
     // driver/{id}/docs/{type}/... so they're easy to find per-driver in S3.
     const ext = path.extname(file.originalname);
-    const DRIVER_DOC_TYPES = ['licence', 'aadhaar', 'aadhaar-front', 'aadhaar-back', 'profile-photo', 'insurance', 'vehicle', 'dbs', 'phv'];
+    const DRIVER_DOC_TYPES = ['licence', 'aadhaar', 'aadhaar-front', 'aadhaar-back', 'profile-photo', 'insurance', 'vehicle', 'dbs', 'phv', 'puc'];
     const isDriverDoc = DRIVER_DOC_TYPES.includes(type);
     const key = isDriverDoc
       ? `driver/${req.user!._id}/docs/${type}/${uuidv4()}${ext}`
@@ -83,7 +83,7 @@ export const uploadFile = async (req: AuthRequest, res: Response): Promise<void>
     // If driver document: UPSERT by type (one entry per type). Re-uploading
     // a previously-rejected doc replaces the URL and resets status to
     // 'pending' so admin reviews it fresh.
-    if (['licence', 'aadhaar', 'aadhaar-front', 'aadhaar-back', 'profile-photo', 'insurance', 'vehicle', 'dbs', 'phv'].includes(type)) {
+    if (DRIVER_DOC_TYPES.includes(type)) {
       const user = await User.findById(req.user!._id);
       if (user && user.driverProfile) {
         const docs = user.driverProfile.documents || [];
@@ -96,6 +96,17 @@ export const uploadFile = async (req: AuthRequest, res: Response): Promise<void>
         }
         user.driverProfile.documents = docs as any;
         user.markModified('driverProfile.documents');
+
+        // Resubmission: if the application was REJECTED and this re-upload
+        // clears the last rejected document, the driver goes back to the
+        // review queue ('pending') — they should wait for approval again,
+        // not sit in 'rejected' forever after fixing everything.
+        if ((user.driverProfile as any).registrationStep === 'rejected') {
+          const stillRejected = docs.some((d: any) => d.status === 'rejected');
+          if (!stillRejected) {
+            (user.driverProfile as any).registrationStep = 'pending';
+          }
+        }
         await user.save();
       }
     }

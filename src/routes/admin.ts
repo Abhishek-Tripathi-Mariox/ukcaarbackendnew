@@ -585,13 +585,30 @@ router.delete('/users/:id', requirePermission(PERMISSIONS.MANAGE_USERS), auditLo
 
 /**
  * Reward paid to a referrer per successful referral, by the referrer's role.
- * Mirrors what the apps advertise (driver ₹200 / customer ₹400). Tweak here.
+ *
+ * These are now ADMIN-CONFIGURED (Settings.referrerRewardDriver /
+ * referrerRewardCustomer) and actually paid out — see payReferrerOnFirstRide in
+ * rideController, which credits the referrer when the person they referred
+ * completes their first ride. They used to be a hardcoded { driver: 200,
+ * customer: 400 } that this report displayed as "earnings" while no money ever
+ * moved. The values below are only the fallback when nothing is configured.
  */
-const REFERRAL_REWARD = { driver: 200, customer: 400 };
+const REFERRAL_REWARD_FALLBACK = { driver: 0, customer: 0 };
+
+async function getReferralRates(): Promise<{ driver: number; customer: number }> {
+  const { Settings } = await import('../models');
+  const cfg: any = await Settings.findOne({ key: 'platform' })
+    .select('referrerRewardDriver referrerRewardCustomer')
+    .lean();
+  return {
+    driver: Math.max(0, Number(cfg?.referrerRewardDriver ?? REFERRAL_REWARD_FALLBACK.driver)),
+    customer: Math.max(0, Number(cfg?.referrerRewardCustomer ?? REFERRAL_REWARD_FALLBACK.customer)),
+  };
+}
 
 /** Mongo $cond expr: pick reward rate from a referrer's role field. */
-const rewardRateExpr = (roleField: string) => ({
-  $cond: [{ $eq: [roleField, 'driver'] }, REFERRAL_REWARD.driver, REFERRAL_REWARD.customer],
+const rewardRateExpr = (roleField: string, rates: { driver: number; customer: number }) => ({
+  $cond: [{ $eq: [roleField, 'driver'] }, rates.driver, rates.customer],
 });
 
 /**
@@ -621,17 +638,33 @@ router.get('/referrals', requirePermission(PERMISSIONS.VIEW_REFERRALS), async (r
       });
     }
 
+    const referralRates = await getReferralRates();
+
     const [listResult, summaryResult] = await Promise.all([
       User.aggregate([
         { $match: { referredBy: { $ne: null } } },
-        { $group: { _id: '$referredBy', referredCount: { $sum: 1 }, lastReferralAt: { $max: '$createdAt' } } },
+        {
+          $group: {
+            _id: '$referredBy',
+            referredCount: { $sum: 1 },
+            // Only referees whose first ride actually triggered a payout count
+            // toward earnings. Billing off referredCount overstated it for
+            // everyone who signed up with a code and never rode.
+            rewardedCount: {
+              $sum: { $cond: [{ $ifNull: ['$referralRewardedAt', false] }, 1, 0] },
+            },
+            // Actual rupees paid out, captured per-referee at payout time.
+            paidEarnings: { $sum: { $ifNull: ['$referralRewardAmount', 0] } },
+            lastReferralAt: { $max: '$createdAt' },
+          },
+        },
         { $lookup: { from: 'users', localField: '_id', foreignField: '_id', as: 'referrer' } },
         { $unwind: '$referrer' },
         ...searchMatch,
         {
           $addFields: {
-            ratePerReferral: rewardRateExpr('$referrer.role'),
-            earnings: { $multiply: ['$referredCount', rewardRateExpr('$referrer.role')] },
+            ratePerReferral: rewardRateExpr('$referrer.role', referralRates),
+            earnings: '$paidEarnings',
           },
         },
         { $sort: { referredCount: -1, lastReferralAt: -1 } },
@@ -652,6 +685,10 @@ router.get('/referrals', requirePermission(PERMISSIONS.VIEW_REFERRALS), async (r
                   role: '$referrer.role',
                   referralCode: '$referrer.referralCode',
                   referredCount: 1,
+                  // How many of those referees actually rode (and therefore
+                  // earned the referrer money). referredCount - rewardedCount
+                  // is the signups that never converted.
+                  rewardedCount: 1,
                   ratePerReferral: 1,
                   earnings: 1,
                   lastReferralAt: 1,
@@ -664,7 +701,14 @@ router.get('/referrals', requirePermission(PERMISSIONS.VIEW_REFERRALS), async (r
       ]),
       User.aggregate([
         { $match: { referredBy: { $ne: null } } },
-        { $group: { _id: '$referredBy', c: { $sum: 1 } } },
+        {
+          $group: {
+            _id: '$referredBy',
+            c: { $sum: 1 },
+            paid: { $sum: { $cond: [{ $ifNull: ['$referralRewardedAt', false] }, 1, 0] } },
+            paidEarnings: { $sum: { $ifNull: ['$referralRewardAmount', 0] } },
+          },
+        },
         { $lookup: { from: 'users', localField: '_id', foreignField: '_id', as: 'referrer' } },
         { $unwind: '$referrer' },
         {
@@ -672,7 +716,7 @@ router.get('/referrals', requirePermission(PERMISSIONS.VIEW_REFERRALS), async (r
             _id: null,
             totalReferrers: { $sum: 1 },
             totalReferred: { $sum: '$c' },
-            totalEarnings: { $sum: { $multiply: ['$c', rewardRateExpr('$referrer.role')] } },
+            totalEarnings: { $sum: '$paidEarnings' },
           },
         },
       ]),
@@ -714,10 +758,22 @@ router.get('/referrals/:userId', requirePermission(PERMISSIONS.VIEW_REFERRALS), 
     }
 
     const referred = await User.find({ referredBy: referrer._id })
-      .select('firstName lastName phone email avatar role isActive createdAt')
+      .select(
+        'firstName lastName phone email avatar role isActive createdAt referralRewardedAt referralRewardAmount',
+      )
       .sort({ createdAt: -1 });
 
-    const rate = referrer.role === 'driver' ? REFERRAL_REWARD.driver : REFERRAL_REWARD.customer;
+    const rates = await getReferralRates();
+    const rate = referrer.role === 'driver' ? rates.driver : rates.customer;
+
+    // Earnings = rupees actually paid (summed from per-referee records), not
+    // signups × today's rate. This endpoint still billed EVERY signup after
+    // the list endpoint was fixed, so the two contradicted each other.
+    const rewarded = referred.filter((u: any) => !!u.referralRewardedAt);
+    const earnings = rewarded.reduce(
+      (sum: number, u: any) => sum + (Number(u.referralRewardAmount) || 0),
+      0,
+    );
 
     res.status(200).json({
       success: true,
@@ -725,7 +781,8 @@ router.get('/referrals/:userId', requirePermission(PERMISSIONS.VIEW_REFERRALS), 
         referrer,
         ratePerReferral: rate,
         referredCount: referred.length,
-        earnings: referred.length * rate,
+        rewardedCount: rewarded.length,
+        earnings,
         referred,
       },
     });
@@ -1808,6 +1865,9 @@ router.put('/rides/:id/cancel', requirePermission(PERMISSIONS.MANAGE_RIDES), aud
       cancelledBy: 'admin',
       reason: reason || 'Cancelled by admin',
       fee: 0,
+      // Admin cancel performs no automatic refund; issue one via the
+      // wallet-adjust endpoint if the ride was already paid.
+      refundAmount: 0,
       cancelledAt: new Date(),
     };
     await ride.save();
@@ -1831,26 +1891,39 @@ router.put('/rides/:id/cancel', requirePermission(PERMISSIONS.MANAGE_RIDES), aud
       });
     }
 
-    // Process refund if requested
+    // Process refund if requested. The paymentStatus flip below is what makes
+    // this idempotent — it used to stay 'completed' after refunding, so the
+    // same ride could be refunded again by this route, resolve-dispute, or a
+    // second admin, each crediting the wallet once more.
     if (refund && ride.paymentStatus === 'completed') {
-      const amount = refundAmount || ride.actualFare || ride.estimatedFare;
+      // Cap at what was actually paid — an arbitrary refundAmount from the
+      // request body could exceed the fare.
+      const paidAmt = Number(ride.actualFare || ride.estimatedFare || 0);
+      const amount = Math.min(Math.max(0, Number(refundAmount) || paidAmt), paidAmt);
 
-      await Payment.create({
-        user: ride.customer,
-        ride: ride._id,
-        type: 'refund',
-        amount,
-        method: ride.paymentMethod,
-        status: 'completed',
-        description: `Ride cancelled - admin refund. ${reason || ''}`,
-      });
+      if (amount > 0) {
+        await Payment.create({
+          user: ride.customer,
+          ride: ride._id,
+          type: 'refund',
+          amount,
+          method: ride.paymentMethod,
+          status: 'completed',
+          description: `Ride cancelled - admin refund. ${reason || ''}`,
+        });
 
-      // Credit to wallet if not cash
-      if (ride.paymentMethod !== 'cash') {
-        await Wallet.findOneAndUpdate(
-          { user: ride.customer },
-          { $inc: { balance: amount } }
-        );
+        // Credit to wallet if not cash
+        if (ride.paymentMethod !== 'cash') {
+          await Wallet.findOneAndUpdate(
+            { user: ride.customer },
+            { $inc: { balance: amount } },
+            { upsert: true },
+          );
+        }
+
+        ride.paymentStatus = 'refunded';
+        if (ride.cancellation) ride.cancellation.refundAmount = amount;
+        await ride.save();
       }
     }
 
@@ -2388,6 +2461,15 @@ router.post('/rides/:id/complete', requirePermission(PERMISSIONS.MANAGE_RIDES), 
 
     await ride.save();
 
+    // Referral reward parity with the normal settlement path — this inline
+    // admin completion bypassed finalizeRideSettlement, so a referee whose
+    // first ride was closed by an admin never earned their referrer anything.
+    {
+      const { payReferrerOnFirstRide } = await import('../controllers/rideController');
+      await payReferrerOnFirstRide(ride.customer, ride);
+      if (ride.driver) await payReferrerOnFirstRide(ride.driver, ride);
+    }
+
     const populated = await Ride.findById(ride._id)
       .populate('customer', 'firstName lastName phone avatar')
       .populate('driver', 'firstName lastName phone avatar driverProfile.rating driverProfile.vehicleMake driverProfile.vehicleModel driverProfile.vehicleColor driverProfile.plateNumber');
@@ -2474,7 +2556,24 @@ router.post('/rides/:id/resolve-dispute', requirePermission(PERMISSIONS.RESOLVE_
       return;
     }
 
-    const refund = Number(refundAmount) || 0;
+    // Idempotency: a dispute can be resolved once. Re-posting used to re-run
+    // the refund block and credit the wallet again on every call.
+    if (ride.dispute?.resolved) {
+      res.status(400).json({
+        success: false,
+        message: 'This dispute has already been resolved.',
+      });
+      return;
+    }
+
+    // Cap the refund at what the customer actually paid. The amount came
+    // straight from the request body with no ceiling, and rides that were
+    // never paid (pending/failed/cancelled-unpaid) could still be "refunded".
+    const paidCap =
+      ride.paymentStatus === 'completed'
+        ? Number(ride.actualFare || ride.estimatedFare || 0)
+        : 0;
+    const refund = Math.min(Math.max(0, Number(refundAmount) || 0), paidCap);
 
     // Issue a wallet refund if requested. Mirrors the /payments/refund flow:
     // record a refund Payment and credit the customer's wallet (cash rides
@@ -3415,7 +3514,11 @@ const GENERAL_SETTINGS_DEFAULTS = {
   maxSearchRadius: 10, // km
   driverTimeout: 30, // seconds
   maintenanceMode: false,
-  referralBonus: 0, // ₹ credited to a user who applies a referral code
+  referralBonus: 0, // ₹ credited to the JOINER who applies a referral code
+  referrerRewardCustomer: 0, // ₹ paid to a CUSTOMER referrer on the referee's 1st ride
+  referrerRewardDriver: 0, // ₹ paid to a DRIVER referrer on the referee's 1st ride
+  safetyHelpline: '', // 24/7 helpline dialled from the rider Safety screen
+  safetyGuidelinesUrl: '', // opened by "Safety guidelines" in the rider app
 };
 
 // Static, non-editable extras the UI/consumers may read.
@@ -3486,6 +3589,18 @@ router.patch(
         const n = Number(body.referralBonus);
         if (Number.isFinite(n)) update.referralBonus = Math.max(0, n);
       }
+      if (body.referrerRewardCustomer !== undefined) {
+        const n = Number(body.referrerRewardCustomer);
+        if (Number.isFinite(n)) update.referrerRewardCustomer = Math.max(0, n);
+      }
+      if (body.referrerRewardDriver !== undefined) {
+        const n = Number(body.referrerRewardDriver);
+        if (Number.isFinite(n)) update.referrerRewardDriver = Math.max(0, n);
+      }
+      if (body.safetyHelpline !== undefined)
+        update.safetyHelpline = String(body.safetyHelpline).trim();
+      if (body.safetyGuidelinesUrl !== undefined)
+        update.safetyGuidelinesUrl = String(body.safetyGuidelinesUrl).trim();
 
       if (Object.keys(update).length === 0) {
         res.status(400).json({ success: false, message: 'No valid settings to update' });

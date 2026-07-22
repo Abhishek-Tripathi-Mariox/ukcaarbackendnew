@@ -314,8 +314,25 @@ export const applyReferral = async (req: AuthRequest, res: Response): Promise<vo
       return;
     }
 
-    me.referredBy = referrer._id;
-    await me.save();
+    // Atomic claim on referredBy. The old read-check-save let N parallel
+    // requests all pass the `me.referredBy` check above and each credit the
+    // joiner bonus — N × referralBonus minted from one code. Only the request
+    // that flips the field from unset wins; everyone else 400s below.
+    const linked = await User.findOneAndUpdate(
+      {
+        _id: me._id,
+        $or: [{ referredBy: null }, { referredBy: { $exists: false } }],
+      },
+      { $set: { referredBy: referrer._id } },
+      { new: true },
+    );
+    if (!linked) {
+      res.status(400).json({
+        success: false,
+        message: 'A referral code has already been applied to your account',
+      });
+      return;
+    }
 
     // One-time joiner bonus. Admin-configured value (Settings.referralBonus)
     // takes precedence over the env default. Guarded by referredBy being
@@ -363,7 +380,27 @@ export const applyReferral = async (req: AuthRequest, res: Response): Promise<vo
  */
 export const deleteAccount = async (req: AuthRequest, res: Response): Promise<void> => {
   try {
-    await User.findByIdAndUpdate(req.user!._id, { isActive: false });
+    // Deactivate AND release the identifiers. Just flipping isActive meant:
+    //  (a) the phone number was locked forever — the user could never sign up
+    //      again, and
+    //  (b) a re-login attempt showed "Your account has been suspended",
+    //      which read as "my account never actually got deleted".
+    // Mangling the phone/email frees them for a fresh signup while keeping
+    // the row (rides, payments, ledger history) intact for audit.
+    const me = await User.findById(req.user!._id).select('phone email');
+    if (!me) {
+      res.status(404).json({ success: false, message: 'User not found' });
+      return;
+    }
+    const stamp = Date.now();
+    await User.findByIdAndUpdate(req.user!._id, {
+      $set: {
+        isActive: false,
+        deletedAt: new Date(),
+        phone: `deleted_${stamp}_${me.phone ?? ''}`,
+        ...(me.email ? { email: `deleted_${stamp}_${me.email}` } : {}),
+      },
+    });
     res.json({ success: true, message: 'Your account has been deleted.' });
   } catch (error) {
     console.error('deleteAccount error:', error);

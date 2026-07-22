@@ -14,6 +14,42 @@ const razorpay = new Razorpay({
 // WalletTopUpScreen so the displayed breakdown matches what's charged.
 const WALLET_GST_RATE = 0.18;
 
+/**
+ * Collect cancellation fees that couldn't be debited at cancel time.
+ *
+ * cancelRide records a `cancellation_fee` Payment with status `pending` when
+ * the wallet balance was too low — but nothing ever collected it, so the fee
+ * existed only as a dead ledger row. Called after every wallet top-up credit:
+ * each pending fee is settled atomically against the (now funded) balance,
+ * oldest first. Never throws — fee collection must not break a top-up.
+ */
+async function collectPendingCancellationFees(userId: any): Promise<void> {
+  try {
+    const pending = await Payment.find({
+      user: userId,
+      type: 'cancellation_fee',
+      status: 'pending',
+    }).sort({ createdAt: 1 });
+    for (const feeRow of pending) {
+      const amt = Math.max(0, Number(feeRow.amount) || 0);
+      if (!amt) continue;
+      // Conditional debit — only succeeds while the balance covers the fee.
+      const debited = await Wallet.findOneAndUpdate(
+        { user: userId, balance: { $gte: amt } },
+        { $inc: { balance: -amt } },
+        { new: true },
+      );
+      if (!debited) break; // balance exhausted; later top-ups retry the rest
+      feeRow.status = 'completed';
+      feeRow.description = 'Cancellation fee (collected from wallet top-up)';
+      await feeRow.save();
+    }
+  } catch (err) {
+    console.error('collectPendingCancellationFees error:', err);
+  }
+}
+
+
 interface RechargeQuote {
   denomination: number; // base recharge value (credited as principal)
   bonus: number; // extra wallet credit on top of the denomination
@@ -435,6 +471,7 @@ export const checkoutCallback = async (req: Request, res: Response): Promise<voi
             { $inc: { balance: payment.walletCredit ?? payment.amount } },
             { upsert: true },
           );
+          await collectPendingCancellationFees(payment.user);
         }
         await activateOnePassFromPayment(payment);
       } else {
@@ -538,6 +575,7 @@ export const verifyPayment = async (req: AuthRequest, res: Response): Promise<vo
         { $inc: { balance: payment.walletCredit ?? payment.amount } },
         { upsert: true, new: true },
       );
+      await collectPendingCancellationFees(payment.user);
     }
 
     // If OnePass subscription, activate it now that payment is verified.
@@ -804,6 +842,7 @@ export const razorpayWebhook = async (req: Request, res: Response): Promise<void
             { $inc: { balance: payment.walletCredit ?? payment.amount } },
             { upsert: true },
           );
+          await collectPendingCancellationFees(payment.user);
         }
         // Mirror of the verifyPayment hook — if the webhook captures
         // before the client's verify call lands (async server-to-server

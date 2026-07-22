@@ -1039,6 +1039,12 @@ export const cancelRouteBooking = async (
         { new: true, upsert: true },
       );
       walletBalanceAfter = refunded.balance;
+      // Record the refund ON the booking — getRides projects refundedAmount
+      // to the app, but nothing ever wrote it here, so cancelled shuttle
+      // bookings were refunded invisibly (the rider had no way to see the
+      // money came back).
+      booking.refundedAmount = booking.totalAmount;
+      await booking.save();
       try {
         await Payment.create({
           user: booking.customer,

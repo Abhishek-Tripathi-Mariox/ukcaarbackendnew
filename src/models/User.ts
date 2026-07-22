@@ -34,6 +34,17 @@ export interface IUser extends Document {
   referralCode?: string;
   /** UserId of whoever's referralCode was used when this account signed up. */
   referredBy?: mongoose.Types.ObjectId;
+  /** When the REFERRER was paid for this account, set on this user's first
+   *  completed ride. Doubles as the idempotency guard — the reward is claimed
+   *  atomically against this field so it can only ever be paid once. */
+  referralRewardedAt?: Date;
+  /** The amount actually paid to the referrer for this account, captured at
+   *  payout time — reports must sum THIS, not multiply counts by the current
+   *  admin rate (which restates history whenever the rate changes). */
+  referralRewardAmount?: number;
+  /** Set when the user self-deleted (Settings → Delete Account). Identifiers
+   *  are mangled at the same time so the phone/email can be reused. */
+  deletedAt?: Date;
   otp?: string;
   otpExpiry?: Date;
   refreshToken?: string;
@@ -193,6 +204,9 @@ const userSchema = new Schema<IUser>(
     dob: { type: Date },
     referralCode: { type: String, unique: true, sparse: true, uppercase: true, trim: true },
     referredBy: { type: Schema.Types.ObjectId, ref: 'User' },
+    referralRewardedAt: { type: Date, default: null },
+    referralRewardAmount: { type: Number, default: 0, min: 0 },
+    deletedAt: { type: Date, default: null },
     otp: { type: String, select: false },
     otpExpiry: { type: Date, select: false },
     refreshToken: { type: String, select: false },

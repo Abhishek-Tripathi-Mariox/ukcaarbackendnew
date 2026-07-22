@@ -82,6 +82,11 @@ export interface IRide extends Document {
     cancelledBy: 'customer' | 'driver' | 'admin' | 'system';
     reason: string;
     fee: number;
+    /** Money actually returned to the rider for this cancellation. 0 when the
+     *  ride was never paid (the normal case — payment happens at completion).
+     *  The app shows a "refunded" line only when this is > 0, so it must never
+     *  be inferred from the fare. */
+    refundAmount: number;
     cancelledAt: Date;
   };
 
@@ -225,6 +230,7 @@ const rideSchema = new Schema<IRide>(
       cancelledBy: { type: String, enum: ['customer', 'driver', 'admin', 'system'] },
       reason: String,
       fee: { type: Number, default: 0 },
+      refundAmount: { type: Number, default: 0 },
       cancelledAt: Date,
     },
 

@@ -14,6 +14,7 @@ import geoRoutes from './geo';
 import vehicleTypeRoutes from './vehicleTypes';
 import routeRoutes from './routes';
 import safetyRoutes from './safety';
+import appSettingsRoutes from './appSettings';
 
 const router = Router();
 
@@ -32,6 +33,9 @@ router.use('/loyalty', loyaltyRoutes);
 router.use('/geo', geoRoutes);
 router.use('/routes', routeRoutes);
 router.use('/safety', safetyRoutes);
+// Public read-only settings the rider app needs (support contacts, referral
+// bonus, safety links) — see appSettings.ts.
+router.use('/settings', appSettingsRoutes);
 router.use('/', vehicleTypeRoutes);
 
 // Health check

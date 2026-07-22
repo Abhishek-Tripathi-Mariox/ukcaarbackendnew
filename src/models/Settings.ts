@@ -35,8 +35,18 @@ export interface ISettings extends Document {
   driverTimeout?: number;
   /** When true, the platform is flagged as under maintenance. */
   maintenanceMode?: boolean;
-  /** Wallet bonus (₹) credited when a user applies a referral code. */
+  /** Wallet bonus (₹) credited to the JOINER when they apply a referral code. */
   referralBonus?: number;
+  /** Reward (₹) paid to the REFERRER once the person they referred completes
+   *  their first ride. Split by the referrer's own role. These used to be the
+   *  hardcoded REFERRAL_REWARD constant in admin.ts, shown in the referrals
+   *  report as "earnings" that were never actually paid to anyone. */
+  referrerRewardCustomer?: number;
+  referrerRewardDriver?: number;
+  /** 24/7 safety helpline the rider app dials from the Safety screen. */
+  safetyHelpline?: string;
+  /** URL opened by "Safety guidelines" in the rider app. */
+  safetyGuidelinesUrl?: string;
 
   updatedBy?: mongoose.Types.ObjectId;
   createdAt: Date;
@@ -57,6 +67,10 @@ const settingsSchema = new Schema<ISettings>(
     driverTimeout: { type: Number, min: 10, max: 120 },
     maintenanceMode: { type: Boolean },
     referralBonus: { type: Number, min: 0 },
+    referrerRewardCustomer: { type: Number, min: 0 },
+    referrerRewardDriver: { type: Number, min: 0 },
+    safetyHelpline: { type: String, trim: true },
+    safetyGuidelinesUrl: { type: String, trim: true },
     updatedBy: { type: Schema.Types.ObjectId, ref: 'User' },
   },
   { timestamps: true }

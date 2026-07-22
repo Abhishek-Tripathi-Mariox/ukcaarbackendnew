@@ -105,6 +105,8 @@ function scheduleAutoCancel(rideId: string): void {
         cancelledBy: 'system',
         reason: 'No driver accepted within 5 minutes',
         fee: 0,
+        // Never dispatched, so never paid — nothing to refund.
+        refundAmount: 0,
         cancelledAt: new Date(),
       };
       await ride.save();
@@ -145,6 +147,8 @@ export async function sweepStaleSearchingRides(): Promise<number> {
         cancelledBy: 'system',
         reason: 'No driver accepted within 5 minutes',
         fee: 0,
+        // Never dispatched, so never paid — nothing to refund.
+        refundAmount: 0,
         cancelledAt: new Date(),
       };
       await ride.save();
@@ -456,6 +460,119 @@ export function clearRateCache(): void {
  * this returns (so app-specific data — wallet balance, etc. — can be
  * included in the payload).
  */
+/**
+ * Pay the REFERRER once the person they referred completes their FIRST ride.
+ *
+ * Previously nobody was ever paid for referring: applying a code credited only
+ * the joiner, and the admin referrals report displayed "earnings" computed from
+ * a hardcoded constant that never moved any money.
+ *
+ * Hardening (each guard closes a verified hole):
+ *  - `ride.actualFare > 0`: a ₹0-fare settlement (or a farmed empty ride)
+ *    minted the full reward. No real fare, no reward.
+ *  - True FIRST-ride gate: the referee must have exactly ONE completed ride
+ *    (the one settling now). Without it, any long-time rider could apply a
+ *    code and mint the reward on their very next trip.
+ *  - Suspended/deactivated referrers are not paid (isActive checked). The
+ *    claim is left unset so the payout still fires if they're reinstated.
+ *  - Rate is read BEFORE claiming, so a disabled program (rate 0) never burns
+ *    the claim.
+ *  - Atomic claim on `referralRewardedAt` (with the paid amount recorded in
+ *    `referralRewardAmount` so reports sum real history, not counts × today's
+ *    rate). If the wallet credit then fails, the claim is ROLLED BACK — it
+ *    used to be burned first, silently losing the payout forever.
+ *  - Works for referred DRIVERS too (call sites pass both parties): a
+ *    referred driver's first completed trip pays their referrer.
+ *
+ * Never throws: a referral-reward failure must not break ride settlement.
+ */
+export async function payReferrerOnFirstRide(refereeId: any, ride?: any): Promise<void> {
+  let claimedUserId: any = null;
+  try {
+    if (!refereeId) return;
+    // No real fare, no reward — blocks ₹0-fare and farmed empty settlements.
+    if (ride && !(Number(ride.actualFare) > 0)) return;
+
+    const referee: any = await User.findById(refereeId)
+      .select('referredBy referralRewardedAt firstName lastName')
+      .lean();
+    if (!referee?.referredBy || referee.referralRewardedAt) return;
+
+    const referrer: any = await User.findById(referee.referredBy)
+      .select('role referralCode isActive')
+      .lean();
+    if (!referrer) return;
+    // A suspended/deleted referrer isn't paid; the claim stays unset so a
+    // reinstated account still gets it on the referee's next completed ride.
+    if (referrer.isActive === false) return;
+
+    const { Settings } = await import('../models');
+    const cfg: any = await Settings.findOne({ key: 'platform' })
+      .select('referrerRewardCustomer referrerRewardDriver')
+      .lean();
+    const amount = Math.max(
+      0,
+      Number(
+        referrer.role === 'driver'
+          ? cfg?.referrerRewardDriver ?? 0
+          : cfg?.referrerRewardCustomer ?? 0,
+      ),
+    );
+    if (!(amount > 0)) return;
+
+    // True first ride: exactly one completed ride (the one that just settled),
+    // counting the referee as rider or driver.
+    const completedCount = await Ride.countDocuments({
+      $or: [{ customer: refereeId }, { driver: refereeId }],
+      status: 'completed',
+    });
+    if (completedCount !== 1) return;
+
+    // Atomic claim — only the first caller matches.
+    const claimed = await User.findOneAndUpdate(
+      {
+        _id: refereeId,
+        referredBy: { $ne: null },
+        $or: [{ referralRewardedAt: null }, { referralRewardedAt: { $exists: false } }],
+      },
+      { $set: { referralRewardedAt: new Date(), referralRewardAmount: amount } },
+      { new: true },
+    );
+    if (!claimed) return;
+    claimedUserId = refereeId;
+
+    await Wallet.findOneAndUpdate(
+      { user: referrer._id },
+      { $inc: { balance: amount } },
+      { upsert: true, new: true },
+    );
+    await Payment.create({
+      user: referrer._id,
+      type: 'bonus',
+      amount,
+      method: 'wallet',
+      status: 'completed',
+      description: `Referral reward — ${
+        [referee.firstName, referee.lastName].filter(Boolean).join(' ') || 'A rider'
+      } completed their first ride`,
+    });
+  } catch (err) {
+    console.error('payReferrerOnFirstRide error:', err);
+    // Roll the claim back so a transient credit failure retries on the next
+    // completed ride instead of silently losing the payout forever.
+    if (claimedUserId) {
+      try {
+        await User.updateOne(
+          { _id: claimedUserId },
+          { $unset: { referralRewardedAt: 1, referralRewardAmount: 1 } },
+        );
+      } catch (rollbackErr) {
+        console.error('payReferrerOnFirstRide rollback failed:', rollbackErr);
+      }
+    }
+  }
+}
+
 export async function finalizeRideSettlement(
   rideId: string,
   paymentMethod: 'wallet' | 'card' | 'cash',
@@ -512,6 +629,12 @@ export async function finalizeRideSettlement(
   }
 
   // ── Side effects below run exactly once (guarded by the atomic claim) ──
+
+  // Referral reward: this may be either party's FIRST completed ride, which
+  // is what actually earns their referrer the payout. Fire-and-forget — it
+  // swallows its own errors so it can never fail a settled ride.
+  await payReferrerOnFirstRide(ride.customer, ride);
+  if (ride.driver) await payReferrerOnFirstRide(ride.driver, ride);
 
   // Driver stats
   if (ride.driver) {
@@ -1825,23 +1948,110 @@ export const cancelRide = async (req: AuthRequest, res: Response): Promise<void>
     }
 
     const cancelledBy = isDriver ? 'driver' : 'customer';
+
+    // Once the trip is physically IN PROGRESS the customer can no longer
+    // cancel — the driver is mid-route and cancelling skipped settlement
+    // entirely, so the whole trip became free (driver earned ₹0 and only a
+    // flat cancellation fee was charged). Same class of hole as the
+    // payment_pending guard above. The driver (breakdown, emergency) and
+    // admin routes can still cancel a live trip.
+    if (ride.status === 'in_progress' && !isDriver) {
+      res.status(400).json({
+        success: false,
+        message:
+          'Your trip is already in progress. Ask your driver to end the trip — you will only be charged for the distance travelled.',
+      });
+      return;
+    }
+
     // A cancellation fee only applies when the CUSTOMER cancels late — never
     // when the driver bails. Previously the fee was charged regardless of who
     // cancelled, so a driver cancelling mid-trip generated a fee against the
-    // (innocent) customer.
+    // (innocent) customer. (in_progress no longer reaches here for customers.)
+    //
+    // Driver-fault reasons are also waived: the app's own preset list includes
+    // "Waiting for long time" / "Unable to contact driver" / "Driver denied…",
+    // yet the reason was stored and never consulted — the rider paid a fee for
+    // the driver's failure. Matched loosely so free-text variants count too.
+    const DRIVER_FAULT_REASON = /waiting for long|unable to contact driver|driver denied|driver asked/i;
+    const isDriverFault = DRIVER_FAULT_REASON.test(String(reason ?? ''));
     const hasFee =
       cancelledBy === 'customer' &&
-      ['driver_arriving', 'driver_arrived', 'in_progress'].includes(ride.status);
+      !isDriverFault &&
+      ['driver_arriving', 'driver_arrived'].includes(ride.status);
     const fee = hasFee ? (await getRideSettings()).cancellationFee : 0;
 
-    ride.status = 'cancelled';
-    ride.cancellation = {
-      cancelledBy,
-      reason: reason || 'No reason provided',
-      fee,
-      cancelledAt: new Date(),
-    };
-    await ride.save();
+    // Atomic cancel claim. This was read-check-save: two overlapping requests
+    // (double-tap, or the rider cancelling as the driver does) both read a
+    // live status, both passed the guard above, and both ran the fee debit —
+    // charging the customer twice. The conditional filter means only the first
+    // writer matches; the loser bails out below without side effects.
+    const claimed = await Ride.findOneAndUpdate(
+      { _id: ride._id, status: { $nin: ['cancelled', 'completed', 'payment_pending'] } },
+      {
+        $set: {
+          status: 'cancelled',
+          cancellation: {
+            cancelledBy,
+            reason: reason || 'No reason provided',
+            fee,
+            refundAmount: 0, // set below once the refund actually succeeds
+            cancelledAt: new Date(),
+          },
+        },
+      },
+      { new: true },
+    );
+    if (!claimed) {
+      // Lost the race — already cancelled/settled by another request.
+      const current = await Ride.findById(ride._id);
+      res.status(200).json({ success: true, message: 'Ride already cancelled', data: { ride: current, fee: 0 } });
+      return;
+    }
+    // Use the claimed document for everything downstream.
+    (ride as any).status = claimed.status;
+    (ride as any).cancellation = claimed.cancellation;
+
+    // ── Money moves below run EXACTLY ONCE (guarded by the claim above) ──
+
+    // If the fare was already PAID, give it back. Payment normally happens at
+    // completion, so a cancelled ride is usually unpaid and nothing is owed —
+    // but when a ride was prepaid there was no refund path at all, leaving the
+    // rider out of pocket while we still charged a cancel fee. Deliberately
+    // AFTER the claim: doing it before meant a request that lost the race had
+    // already issued a second refund.
+    let refundAmount = 0;
+    if (ride.paymentStatus === 'completed') {
+      const paid = await Payment.findOne({
+        ride: ride._id,
+        type: 'ride_payment',
+        status: 'completed',
+      }).sort({ createdAt: -1 });
+      const paidAmt = Math.max(0, Number(paid?.amount ?? ride.actualFare ?? 0));
+      if (paidAmt > 0) {
+        await Wallet.findOneAndUpdate(
+          { user: ride.customer },
+          { $inc: { balance: paidAmt } },
+          { upsert: true, new: true },
+        );
+        await Payment.create({
+          user: ride.customer,
+          ride: ride._id,
+          type: 'ride_payment',
+          amount: paidAmt,
+          method: 'wallet',
+          status: 'refunded',
+          description: 'Refund for cancelled ride',
+        });
+        refundAmount = paidAmt;
+        await Ride.updateOne(
+          { _id: ride._id },
+          { $set: { paymentStatus: 'refunded', 'cancellation.refundAmount': paidAmt } },
+        );
+        (ride as any).paymentStatus = 'refunded';
+        if ((ride as any).cancellation) (ride as any).cancellation.refundAmount = paidAmt;
+      }
+    }
 
     // A manual cancel overrides the 5-minute auto-cancel timer.
     clearAutoCancel(String(ride._id));
@@ -1858,14 +2068,14 @@ export const cancelRide = async (req: AuthRequest, res: Response): Promise<void>
     if (cancelledBy === 'customer' && ride.driver) {
       emitToUser(ride.driver.toString(), 'ride:cancelled', {
         rideId: String(ride._id),
-        reason: ride.cancellation.reason,
+        reason: claimed.cancellation?.reason,
         cancelledBy,
         message: 'The customer cancelled this ride.',
       });
     } else if (cancelledBy === 'driver') {
       emitToUser(ride.customer.toString(), 'ride:cancelled', {
         rideId: String(ride._id),
-        reason: ride.cancellation.reason,
+        reason: claimed.cancellation?.reason,
         cancelledBy,
         message: 'The driver cancelled this ride. You can book a new one.',
       });
@@ -1997,14 +2207,33 @@ export const rateRide = async (req: AuthRequest, res: Response): Promise<void> =
       return;
     }
 
+    // One rating per party per ride. There was no re-rating guard at all, so
+    // a rating could be overwritten forever (each overwrite also re-entering
+    // the driver-average recompute) and every re-submit blanked the previous
+    // comment/tags with undefined.
+    if (isCustomer && (ride.rating?.customerToDriver ?? 0) > 0) {
+      res.status(400).json({
+        success: false,
+        message: 'You have already rated this trip.',
+      });
+      return;
+    }
+    if (isDriver && (ride.rating?.driverToCustomer ?? 0) > 0) {
+      res.status(400).json({
+        success: false,
+        message: 'You have already rated this rider.',
+      });
+      return;
+    }
+
     if (!ride.rating) {
       ride.rating = {} as any;
     }
 
     if (isCustomer) {
       ride.rating!.customerToDriver = rating;
-      ride.rating!.customerComment = comment;
-      ride.rating!.tags = tags;
+      if (comment !== undefined) ride.rating!.customerComment = comment;
+      if (tags !== undefined) ride.rating!.tags = tags;
 
       // Tip — idempotent (applied at most once) and actually moved from the
       // customer's wallet to the driver's wallet. Previously it (a) stacked on
@@ -2089,7 +2318,7 @@ export const rateRide = async (req: AuthRequest, res: Response): Promise<void> =
       }
     } else {
       ride.rating!.driverToCustomer = rating;
-      ride.rating!.driverComment = comment;
+      if (comment !== undefined) ride.rating!.driverComment = comment;
     }
 
     await ride.save();

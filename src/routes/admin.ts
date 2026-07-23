@@ -1225,7 +1225,7 @@ router.get('/onepass/subscribers', async (req: Request, res: Response) => {
 
     const [subscribers, total] = await Promise.all([
       User.find(filter)
-        .select('firstName lastName phone email driverProfile.onePassExpiry driverProfile.totalEarnings driverProfile.totalTrips')
+        .select('firstName lastName phone email driverProfile.onePassExpiry driverProfile.totalEarnings driverProfile.totalTrips driverProfile.rating driverProfile.vehicleMake driverProfile.vehicleModel')
         .sort({ 'driverProfile.onePassExpiry': -1 })
         .skip((page - 1) * limit)
         .limit(limit),

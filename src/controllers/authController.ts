@@ -532,7 +532,10 @@ export const driverSignup = async (req: Request, res: Response): Promise<void> =
         plateNumber,
         insuranceNumber: insuranceNumber || '',
         isOnline: false,
-        rating: 5.0,
+        // A brand-new driver has no ratings yet — true value is 0 (the apps
+        // display a neutral 5.0 until the first real rating). Was 5.0.
+        rating: 0,
+        ratingCount: 0,
         totalTrips: 0,
         totalEarnings: 0,
         isOnePass: false,

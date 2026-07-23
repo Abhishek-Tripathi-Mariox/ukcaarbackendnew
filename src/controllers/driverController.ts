@@ -71,6 +71,7 @@ export const updateRegistrationStep = async (
       'vehicleModel',
       'vehicleYear',
       'vehicleColor',
+      'seatingCapacity',
       'plateNumber',
       'insuranceNumber',
       'insuranceExpiry',
@@ -381,13 +382,19 @@ export const getMyRatings = async (req: AuthRequest, res: Response): Promise<voi
  * Server-authoritative OnePass plans (label + price + days) for the app to render.
  */
 export const getOnePassPlans = async (_req: AuthRequest, res: Response): Promise<void> => {
-  const plans = Object.entries(config.onePass.plans).map(([key, p]) => ({
-    key,
-    label: p.label,
-    price: p.price,
-    days: p.days,
-    currency: config.onePass.currency,
-  }));
+  // Admin-configured plans (Settings) with a config fallback — a driver can
+  // only ever be offered a plan/price the admin actually set.
+  const { resolveOnePassPlans } = await import('../utils/onePassPlans');
+  const all = await resolveOnePassPlans();
+  const plans = all
+    .filter((p) => p.active)
+    .map((p) => ({
+      key: p.key,
+      label: p.label,
+      price: p.price,
+      days: p.days,
+      currency: config.onePass.currency,
+    }));
   res.json({ success: true, data: { plans } });
 };
 
@@ -639,9 +646,35 @@ export const getMyEarnings = async (req: AuthRequest, res: Response): Promise<vo
     const grossEarnings = Math.round((netEarnings + platformFee) * 100) / 100;
     const fuelAllowance = 0; // removed — was a fabricated inflation of earnings
 
+    // Daily + weekly totals for the Earnings screen's period filter (it only
+    // had monthly before). Today = since local midnight; week = last 7 days.
+    const startOfToday = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+    const startOfWeek = new Date(startOfToday);
+    startOfWeek.setDate(startOfToday.getDate() - 6); // rolling 7-day window
+    const periodAgg = async (start: Date) => {
+      const agg = await Payment.aggregate([
+        {
+          $match: {
+            user: driverId,
+            type: 'ride_payment',
+            status: 'completed',
+            createdAt: { $gte: start },
+          },
+        },
+        { $group: { _id: null, total: { $sum: '$amount' }, rides: { $sum: 1 } } },
+      ]);
+      return { total: agg[0]?.total ?? 0, completedRides: agg[0]?.rides ?? 0 };
+    };
+    const [todayStats, weekStats] = await Promise.all([
+      periodAgg(startOfToday),
+      periodAgg(startOfWeek),
+    ]);
+
     res.status(200).json({
       success: true,
       data: {
+        today: todayStats,
+        thisWeek: weekStats,
         thisMonth: {
           total: thisMonth,
           growthPct,

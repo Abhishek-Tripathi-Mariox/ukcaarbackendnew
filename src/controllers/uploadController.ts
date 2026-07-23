@@ -89,8 +89,13 @@ export const uploadFile = async (req: AuthRequest, res: Response): Promise<void>
         const docs = user.driverProfile.documents || [];
         const idx = docs.findIndex((d: any) => d.type === type);
         if (idx >= 0) {
+          const wasRejected = docs[idx].status === 'rejected';
           docs[idx].url = fileUrl;
           docs[idx].status = 'pending';
+          docs[idx].rejectionReason = undefined; // fixed → clear the old reason
+          // Flag a re-submission so the admin panel can show "Re-submitted"
+          // rather than an indistinguishable "pending".
+          if (wasRejected) docs[idx].resubmittedAt = new Date();
         } else {
           docs.push({ type, url: fileUrl, status: 'pending' });
         }

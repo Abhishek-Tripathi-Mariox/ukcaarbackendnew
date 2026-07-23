@@ -43,6 +43,8 @@ export interface ISettings extends Document {
    *  report as "earnings" that were never actually paid to anyone. */
   referrerRewardCustomer?: number;
   referrerRewardDriver?: number;
+  /** Admin-configured OnePass plans the driver app offers. */
+  onePassPlans?: { key: string; label: string; price: number; days: number; active: boolean }[];
   /** 24/7 safety helpline the rider app dials from the Safety screen. */
   safetyHelpline?: string;
   /** URL opened by "Safety guidelines" in the rider app. */
@@ -69,6 +71,15 @@ const settingsSchema = new Schema<ISettings>(
     referralBonus: { type: Number, min: 0 },
     referrerRewardCustomer: { type: Number, min: 0 },
     referrerRewardDriver: { type: Number, min: 0 },
+    onePassPlans: [
+      {
+        key: { type: String },
+        label: { type: String },
+        price: { type: Number, min: 0 },
+        days: { type: Number, min: 1 },
+        active: { type: Boolean, default: true },
+      },
+    ],
     safetyHelpline: { type: String, trim: true },
     safetyGuidelinesUrl: { type: String, trim: true },
     updatedBy: { type: Schema.Types.ObjectId, ref: 'User' },

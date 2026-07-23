@@ -2314,6 +2314,9 @@ export const rateRide = async (req: AuthRequest, res: Response): Promise<void> =
 
         await User.findByIdAndUpdate(ride.driver, {
           'driverProfile.rating': Math.round(avgRating * 100) / 100,
+          // Real count of ratings received. The apps show the true average
+          // once this is > 0, and a friendly 5.0 before then.
+          'driverProfile.ratingCount': scores.length,
         });
       }
     } else {

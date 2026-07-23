@@ -208,7 +208,7 @@ const approveHandler = async (req: Request, res: Response) => {
     }).catch((e) => console.warn('[approve] push failed:', e));
     await Notification.create({
       user: driver._id,
-      title: 'You are approved! 🎉',
+      title: 'You are approved!',
       body: 'Your driver application has been approved. Go online to start receiving bookings.',
       type: 'system',
     }).catch(() => {});
@@ -437,26 +437,50 @@ router.patch(
           .json({ success: false, message: 'status must be verified|rejected|pending' });
         return;
       }
+      // A rejection MUST carry a reason — it's what the driver sees and acts
+      // on. Rejecting silently left them staring at "re-upload" with no idea
+      // what was wrong.
+      if (normalized === 'rejected' && (!note || !String(note).trim())) {
+        res.status(400).json({
+          success: false,
+          message: 'A rejection reason is required so the driver knows what to fix.',
+        });
+        return;
+      }
       const driver = await User.findById(req.params.id);
       if (!driver || driver.role !== 'driver' || !driver.driverProfile) {
         res.status(404).json({ success: false, message: 'Driver not found' });
         return;
       }
-      const docs = driver.driverProfile.documents || [];
+      const docs: any = driver.driverProfile.documents || [];
       const idx = docs.findIndex((d: any) => d.type === req.params.documentType);
       if (idx === -1) {
         res.status(404).json({ success: false, message: 'Document not found' });
         return;
       }
       docs[idx].status = normalized;
+      docs[idx].reviewedAt = new Date();
+      // Persist / clear the reason on the doc itself so it survives and the
+      // driver + admin can both read it (was previously only in a push).
+      docs[idx].rejectionReason = normalized === 'rejected' ? String(note).trim() : undefined;
+      // Reviewing clears the "re-submitted" flag — it's been looked at now.
+      docs[idx].resubmittedAt = undefined;
       driver.markModified('driverProfile.documents');
-      if (
-        normalized === 'rejected' &&
-        (driver.driverProfile as any).registrationStep === 'pending'
-      ) {
-        // Surface the rejection as an application-level state so the app
-        // flips from "waiting approval" to "fix your documents".
+
+      const step = (driver.driverProfile as any).registrationStep;
+      if (normalized === 'rejected' && (step === 'pending' || step === 'approved')) {
+        // Surface the rejection as an application-level state so the app flips
+        // from "waiting approval" to "fix your documents".
         (driver.driverProfile as any).registrationStep = 'rejected';
+      } else if (normalized === 'verified' && step === 'rejected') {
+        // Recovering a rejected application: once the admin re-approves the
+        // last outstanding rejected doc, put the driver back in the review
+        // queue automatically (they were stuck in 'rejected' forever, with no
+        // way for the admin to move a re-uploaded doc forward).
+        const anyRejected = docs.some((d: any) => d.status === 'rejected');
+        if (!anyRejected) {
+          (driver.driverProfile as any).registrationStep = 'pending';
+        }
       }
       await driver.save();
 

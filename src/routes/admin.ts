@@ -1338,6 +1338,73 @@ router.put('/onepass/:driverId/cancel', requirePermission(PERMISSIONS.MANAGE_ONE
  * POST /api/v1/admin/onepass/:driverId/grant
  * Grant free OnePass subscription
  */
+// ── OnePass PLAN configuration (price/duration the driver app offers) ──
+// GET /api/v1/admin/onepass/plans
+router.get('/onepass/plans', requirePermission(PERMISSIONS.MANAGE_ONEPASS), async (_req: Request, res: Response) => {
+  try {
+    const { resolveOnePassPlans } = await import('../utils/onePassPlans');
+    res.status(200).json({ success: true, data: { plans: await resolveOnePassPlans() } });
+  } catch (error) {
+    console.error('GET /onepass/plans error:', error);
+    res.status(500).json({ success: false, message: 'Failed to fetch OnePass plans' });
+  }
+});
+
+// PATCH /api/v1/admin/onepass/plans — replace the plan list.
+router.patch(
+  '/onepass/plans',
+  requirePermission(PERMISSIONS.MANAGE_ONEPASS),
+  auditLog({ action: 'onepass.update_plans', resourceType: 'Settings' }),
+  async (req: Request, res: Response) => {
+    try {
+      const { plans } = req.body ?? {};
+      if (!Array.isArray(plans)) {
+        res.status(400).json({ success: false, message: 'plans array is required' });
+        return;
+      }
+      const clean = plans
+        .map((p: any) => ({
+          key: String(p.key || '').trim().toLowerCase(),
+          label: String(p.label || '').trim(),
+          price: Math.max(0, Number(p.price) || 0),
+          days: Math.max(1, Math.round(Number(p.days) || 1)),
+          active: p.active !== false,
+        }))
+        .filter((p: any) => p.key && p.label);
+      // A paid plan can't cost 0 — order creation rejects a 0 amount, so an
+      // active 0-price plan would show in the app then fail at purchase.
+      const badPrice = clean.find((p: any) => p.active && !(p.price > 0));
+      if (badPrice) {
+        res.status(400).json({
+          success: false,
+          message: `Plan "${badPrice.label}" must have a price greater than 0 (or set it inactive).`,
+        });
+        return;
+      }
+      if (!clean.length) {
+        res.status(400).json({ success: false, message: 'At least one valid plan is required' });
+        return;
+      }
+      // Reject duplicate keys — the driver app keys plans uniquely.
+      const keys = new Set(clean.map((p: any) => p.key));
+      if (keys.size !== clean.length) {
+        res.status(400).json({ success: false, message: 'Plan keys must be unique' });
+        return;
+      }
+      const { Settings } = await import('../models');
+      const doc = await Settings.findOneAndUpdate(
+        { key: 'platform' },
+        { $set: { onePassPlans: clean, updatedBy: (req as any).user?._id } },
+        { new: true, upsert: true },
+      );
+      res.status(200).json({ success: true, data: { plans: doc?.onePassPlans ?? clean } });
+    } catch (error) {
+      console.error('PATCH /onepass/plans error:', error);
+      res.status(500).json({ success: false, message: 'Failed to update OnePass plans' });
+    }
+  },
+);
+
 router.post('/onepass/:driverId/grant', requirePermission(PERMISSIONS.MANAGE_ONEPASS), auditLog({ action: 'onepass.grant', resourceType: 'User', resourceId: (req) => req.params.driverId }), async (req: Request, res: Response) => {
   try {
     const { days, reason } = req.body;

@@ -78,6 +78,7 @@ export interface IUser extends Document {
     vehicleModel: string;
     vehicleYear: string;
     vehicleColor: string;
+    seatingCapacity?: number;
     plateNumber: string;
     insuranceNumber: string;
     /** When their insurance expires — captured as a date on the registration form. */
@@ -124,6 +125,7 @@ export interface IUser extends Document {
     isOnline: boolean;
     currentLocation?: { lat: number; lng: number };
     rating: number;
+    ratingCount: number;
     totalTrips: number;
     totalEarnings: number;
     commissionRate?: number;
@@ -134,6 +136,9 @@ export interface IUser extends Document {
       url: string;
       status: 'pending' | 'verified' | 'rejected';
       expiry?: Date;
+      rejectionReason?: string;
+      reviewedAt?: Date;
+      resubmittedAt?: Date;
     }[];
     /**
      * Bank details captured on the "complete profile" step. Used for payouts.
@@ -243,6 +248,7 @@ const userSchema = new Schema<IUser>(
       vehicleModel: String,
       vehicleYear: String,
       vehicleColor: String,
+      seatingCapacity: { type: Number },
       plateNumber: String,
       insuranceNumber: String,
       insuranceExpiry: Date,
@@ -274,7 +280,8 @@ const userSchema = new Schema<IUser>(
         lat: Number,
         lng: Number,
       },
-      rating: { type: Number, default: 5.0 },
+      rating: { type: Number, default: 0 },
+      ratingCount: { type: Number, default: 0 },
       totalTrips: { type: Number, default: 0 },
       totalEarnings: { type: Number, default: 0 },
       commissionRate: { type: Number, min: 0, max: 100, default: undefined },
@@ -284,6 +291,9 @@ const userSchema = new Schema<IUser>(
         {
           type: { type: String },
           url: String,
+          rejectionReason: { type: String },
+          reviewedAt: { type: Date },
+          resubmittedAt: { type: Date },
           status: {
             type: String,
             enum: ['pending', 'verified', 'rejected'],

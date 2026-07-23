@@ -45,6 +45,8 @@ export interface IPayment extends Document {
   rechargeOffer?: mongoose.Types.ObjectId;
   /** For subscription (OnePass): which plan key was purchased (weekly/monthly/annual). */
   subscriptionPlan?: string;
+  /** For subscription (OnePass): validity days snapshotted at order time, so activation survives later plan edits. */
+  subscriptionDays?: number;
   /** For cashout: which payout channel was requested. */
   payoutMethod?: 'bank' | 'upi';
   /** For cashout: snapshot of the destination so it survives bank-detail edits. */
@@ -97,6 +99,7 @@ const paymentSchema = new Schema<IPayment>(
     bonusAmount: { type: Number },
     rechargeOffer: { type: Schema.Types.ObjectId, ref: 'RechargeOffer' },
     subscriptionPlan: { type: String },
+    subscriptionDays: { type: Number },
     payoutMethod: { type: String, enum: ['bank', 'upi'] },
     payoutDestination: {
       bankName: String,

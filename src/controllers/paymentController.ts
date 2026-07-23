@@ -191,13 +191,21 @@ export const getWallet = async (req: AuthRequest, res: Response): Promise<void> 
  */
 async function activateOnePassFromPayment(payment: any): Promise<void> {
   if (payment.type !== 'subscription' || !payment.subscriptionPlan) return;
-  const planDef = config.onePass.plans[payment.subscriptionPlan];
-  if (!planDef) return;
+  // Prefer the validity window snapshotted at order time. Only fall back to the
+  // live plan table for legacy payments created before we stored it — never let
+  // a since-deleted/renamed plan key strand a driver who already paid.
+  let days: number | undefined = payment.subscriptionDays;
+  if (!days) {
+    const { findOnePassPlan } = await import('../utils/onePassPlans');
+    const planDef = await findOnePassPlan(payment.subscriptionPlan);
+    days = planDef?.days;
+  }
+  if (!days || days <= 0) return;
 
   const user = await User.findById(payment.user).select('driverProfile.onePassExpiry');
   const currentExpiry = (user as any)?.driverProfile?.onePassExpiry;
   const base = currentExpiry && new Date(currentExpiry) > new Date() ? new Date(currentExpiry) : new Date();
-  const expiry = new Date(base.getTime() + planDef.days * 24 * 60 * 60 * 1000);
+  const expiry = new Date(base.getTime() + days * 24 * 60 * 60 * 1000);
 
   await User.findByIdAndUpdate(payment.user, {
     'driverProfile.isOnePass': true,
@@ -205,8 +213,31 @@ async function activateOnePassFromPayment(payment: any): Promise<void> {
   });
 }
 
+
+/**
+ * True when the caller is a DRIVER whose application isn't approved yet.
+ * Unverified drivers must not move money — no wallet top-ups, no OnePass,
+ * no cashouts. (Customers are unaffected; the driver app now shows a
+ * "verification pending" gate, this is the server-side backstop.)
+ */
+async function isUnapprovedDriver(userId: any): Promise<boolean> {
+  const u: any = await User.findById(userId)
+    .select('role driverProfile.registrationStep')
+    .lean();
+  return u?.role === 'driver' && u?.driverProfile?.registrationStep !== 'approved';
+}
+
 export const createOrder = async (req: AuthRequest, res: Response): Promise<void> => {
   try {
+    if (await isUnapprovedDriver(req.user!._id)) {
+      res.status(403).json({
+        success: false,
+        message:
+          'Your account is awaiting verification. Payments unlock once your registration is approved.',
+      });
+      return;
+    }
+
     const {
       amount,
       type = 'wallet_topup',
@@ -225,17 +256,27 @@ export const createOrder = async (req: AuthRequest, res: Response): Promise<void
     let bonusAmount: number | undefined;
     let offerDoc: any = null;
     let subscriptionPlan: string | undefined;
+    let subscriptionDays: number | undefined;
 
     if (type === 'subscription') {
       // OnePass purchase — price comes from the server-side plan table; the
       // client only chooses a plan key. Activation happens on verify.
-      const planDef = config.onePass.plans[String(plan)];
+      const { findOnePassPlan } = await import('../utils/onePassPlans');
+      const planDef = await findOnePassPlan(String(plan));
       if (!planDef) {
         res.status(400).json({ success: false, message: 'Invalid OnePass plan' });
         return;
       }
+      if (planDef.active === false || !(planDef.price > 0)) {
+        res.status(400).json({ success: false, message: 'This OnePass plan is unavailable' });
+        return;
+      }
       chargeAmount = planDef.price;
       subscriptionPlan = String(plan);
+      // Snapshot the validity window NOW. If an admin later deletes or renames
+      // this plan key, activation must still honour what the driver paid for
+      // instead of silently no-op'ing after the charge is captured.
+      subscriptionDays = planDef.days;
     } else if (type === 'wallet_topup') {
       let quote: RechargeQuote;
       if (offerId) {
@@ -344,6 +385,7 @@ export const createOrder = async (req: AuthRequest, res: Response): Promise<void
       ...(bonusAmount !== undefined && { bonusAmount }),
       ...(offerDoc && { rechargeOffer: offerDoc._id }),
       ...(subscriptionPlan && { subscriptionPlan }),
+      ...(subscriptionDays && { subscriptionDays }),
       method: methodPreference === 'wallet' ? 'wallet' : 'card',
       status: 'pending',
       razorpayOrderId: order.id,
@@ -844,6 +886,13 @@ export const razorpayWebhook = async (req: Request, res: Response): Promise<void
           );
           await collectPendingCancellationFees(payment.user);
         }
+        // OnePass subscription: the webhook may capture before the client's
+        // verify call (or instead of it). Without this branch the driver was
+        // charged but never got OnePass. activateOnePassFromPayment is
+        // idempotent, so a later verify won't double-activate.
+        if (payment.type === 'subscription') {
+          await activateOnePassFromPayment(payment);
+        }
         // Mirror of the verifyPayment hook — if the webhook captures
         // before the client's verify call lands (async server-to-server
         // path), still settle the ride. The helper is idempotent so a
@@ -1005,6 +1054,15 @@ export const getReceivedAmounts = async (req: AuthRequest, res: Response): Promi
  */
 export const requestCashout = async (req: AuthRequest, res: Response): Promise<void> => {
   try {
+    if (await isUnapprovedDriver(req.user!._id)) {
+      res.status(403).json({
+        success: false,
+        message:
+          'Your account is awaiting verification. Cashouts unlock once your registration is approved.',
+      });
+      return;
+    }
+
     const { amount, method = 'bank', upiId } = req.body as {
       amount?: number;
       method?: 'bank' | 'upi';

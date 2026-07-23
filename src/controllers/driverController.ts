@@ -670,6 +670,39 @@ export const getMyEarnings = async (req: AuthRequest, res: Response): Promise<vo
       periodAgg(startOfWeek),
     ]);
 
+    // Per-period series so the Earnings screen's Daily/Weekly tabs can plot the
+    // same bar chart the Monthly tab uses (which plots `trend`). Bucket in
+    // server-local time (Asia/Kolkata, no DST) so buckets line up with the
+    // startOfToday/startOfWeek boundaries above — avoids $hour/$dayOfWeek UTC
+    // skew. One driver's week of ride payments is small, so find + JS-bucket.
+    const weekPayments = await Payment.find({
+      user: driverId,
+      type: 'ride_payment',
+      status: 'completed',
+      createdAt: { $gte: startOfWeek },
+    })
+      .select('amount createdAt')
+      .lean();
+
+    const weekSeries: { label: string; value: number }[] = [];
+    for (let i = 0; i < 7; i++) {
+      const day = new Date(startOfWeek);
+      day.setDate(startOfWeek.getDate() + i);
+      weekSeries.push({ label: day.toLocaleString('en-US', { weekday: 'short' }), value: 0 });
+    }
+    const hourlySeries = ['12a', '4a', '8a', '12p', '4p', '8p'].map((label) => ({ label, value: 0 }));
+    for (const p of weekPayments) {
+      const d = new Date(p.createdAt);
+      const dayIdx = Math.floor((d.getTime() - startOfWeek.getTime()) / 86400000);
+      if (dayIdx >= 0 && dayIdx < 7) weekSeries[dayIdx].value += p.amount;
+      if (d >= startOfToday) {
+        const bucket = Math.min(5, Math.floor(d.getHours() / 4));
+        hourlySeries[bucket].value += p.amount;
+      }
+    }
+    weekSeries.forEach((s) => (s.value = Math.round(s.value)));
+    hourlySeries.forEach((s) => (s.value = Math.round(s.value)));
+
     res.status(200).json({
       success: true,
       data: {
@@ -681,6 +714,9 @@ export const getMyEarnings = async (req: AuthRequest, res: Response): Promise<vo
           completedRides: ridesThisMonthCount,
         },
         trend,
+        hourlySeries, // Daily tab — today in 4-hour buckets
+        weekSeries, // Weekly tab — last 7 days
+
         breakdown: {
           // totalEarned is GROSS (what riders paid) so Gross − Fee = Net
           // reconciles; netEarnings is the wallet-matching take-home.

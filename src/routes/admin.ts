@@ -1,4 +1,5 @@
 import { Router, Request, Response } from 'express';
+import mongoose from 'mongoose';
 import { istDateStr } from '../utils/date';
 import { User, Ride, Payment, Wallet, Chat, PromoCode, Notification } from '../models';
 import { sendPushToTokens } from '../config/firebase';
@@ -1221,6 +1222,14 @@ router.get('/onepass/subscribers', async (req: Request, res: Response) => {
       filter['driverProfile.onePassExpiry'] = { $lt: new Date() };
     } else if (status === 'active') {
       filter['driverProfile.onePassExpiry'] = { $gte: new Date() };
+    } else if (status === 'expiring') {
+      // Expiring within the next 7 days — the dropdown offered this but the
+      // backend ignored it, so it used to return every subscriber.
+      const soon = new Date();
+      filter['driverProfile.onePassExpiry'] = {
+        $gte: soon,
+        $lte: new Date(soon.getTime() + 7 * 24 * 60 * 60 * 1000),
+      };
     }
 
     const [subscribers, total] = await Promise.all([
@@ -1247,12 +1256,23 @@ router.get('/onepass/subscribers', async (req: Request, res: Response) => {
  */
 router.get('/onepass/stats', async (_req: Request, res: Response) => {
   try {
-    const [total, active, expired, revenue] = await Promise.all([
+    // Keys must match what OnePassPage reads: activeSubscribers, expiringSoon,
+    // totalRevenue, monthlyRevenue. The page previously read those names off a
+    // {total,active,expired,revenue} payload, so every card showed 0/₹0.
+    const now = new Date();
+    const in7Days = new Date(now.getTime() + 7 * 24 * 60 * 60 * 1000);
+    const monthStart = new Date(now.getFullYear(), now.getMonth(), 1);
+    const [total, active, expired, expiringSoon, revenue, monthRevenue] = await Promise.all([
       User.countDocuments({ role: 'driver', 'driverProfile.isOnePass': true }),
-      User.countDocuments({ role: 'driver', 'driverProfile.isOnePass': true, 'driverProfile.onePassExpiry': { $gte: new Date() } }),
-      User.countDocuments({ role: 'driver', 'driverProfile.isOnePass': true, 'driverProfile.onePassExpiry': { $lt: new Date() } }),
+      User.countDocuments({ role: 'driver', 'driverProfile.isOnePass': true, 'driverProfile.onePassExpiry': { $gte: now } }),
+      User.countDocuments({ role: 'driver', 'driverProfile.isOnePass': true, 'driverProfile.onePassExpiry': { $lt: now } }),
+      User.countDocuments({ role: 'driver', 'driverProfile.isOnePass': true, 'driverProfile.onePassExpiry': { $gte: now, $lte: in7Days } }),
       Payment.aggregate([
         { $match: { type: 'subscription', status: 'completed' } },
+        { $group: { _id: null, total: { $sum: '$amount' } } },
+      ]),
+      Payment.aggregate([
+        { $match: { type: 'subscription', status: 'completed', createdAt: { $gte: monthStart } } },
         { $group: { _id: null, total: { $sum: '$amount' } } },
       ]),
     ]);
@@ -1261,9 +1281,11 @@ router.get('/onepass/stats', async (_req: Request, res: Response) => {
       success: true,
       data: {
         total,
-        active,
+        activeSubscribers: active,
         expired,
-        revenue: revenue[0]?.total || 0,
+        expiringSoon,
+        totalRevenue: revenue[0]?.total || 0,
+        monthlyRevenue: monthRevenue[0]?.total || 0,
       },
     });
   } catch (error) {
@@ -1408,6 +1430,18 @@ router.patch(
 router.post('/onepass/:driverId/grant', requirePermission(PERMISSIONS.MANAGE_ONEPASS), auditLog({ action: 'onepass.grant', resourceType: 'User', resourceId: (req) => req.params.driverId }), async (req: Request, res: Response) => {
   try {
     const { days, reason } = req.body;
+
+    // Guard the id: an invalid ObjectId threw a CastError → 500, and a valid
+    // but non-existent id matched nothing yet still returned a "granted" toast.
+    if (!mongoose.isValidObjectId(req.params.driverId)) {
+      res.status(400).json({ success: false, message: 'Invalid driver id' });
+      return;
+    }
+    const driver = await User.findById(req.params.driverId).select('role');
+    if (!driver || driver.role !== 'driver') {
+      res.status(404).json({ success: false, message: 'Driver not found' });
+      return;
+    }
 
     const newExpiry = new Date(Date.now() + (days || 30) * 24 * 60 * 60 * 1000);
 

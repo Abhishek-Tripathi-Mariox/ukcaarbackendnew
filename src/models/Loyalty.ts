@@ -234,11 +234,15 @@ const redemptionSchema = new Schema<ILoyaltyRedemption>(
   {
     user: { type: Schema.Types.ObjectId, ref: 'User', required: true, index: true },
     reward: { type: Schema.Types.ObjectId, ref: 'LoyaltyReward', required: true },
+    // Each field must use the `{ type: X }` long form. A bare `type: String`
+    // inside a nested object makes Mongoose read `type` as this path's own
+    // SchemaType, collapsing the whole snapshot into a single String path —
+    // which then throws "Cast to string failed" on every create().
     rewardSnapshot: {
-      name: String,
-      type: String,
-      value: Number,
-      pointsCost: Number,
+      name: { type: String },
+      type: { type: String },
+      value: { type: Number },
+      pointsCost: { type: Number },
     },
     code: { type: String, required: true, unique: true, uppercase: true },
     status: {

@@ -4,6 +4,10 @@ import { Ride, User, Wallet, Payment, PromoCode } from '../models';
 import { config } from '../config';
 import { getRideSettings } from '../utils/rideSettings';
 import { AuthRequest } from '../middleware/auth';
+import {
+  APPROVED_DRIVER_QUERY,
+  driverWorkBlockReason,
+} from '../middleware/driverApproval';
 import { processRideForIncentives } from '../services/incentivesEngine';
 import {
   awardPointsForRide,
@@ -262,9 +266,13 @@ async function dispatchToNearbyDrivers(ride: any): Promise<void> {
   // drivers who registered before vehicleTypeCode was required got
   // silently excluded from every dispatch (root cause of "bell never
   // rings for instant bookings" reports).
+  //
+  // APPROVED_DRIVER_QUERY carries role/isActive/registrationStep: without the
+  // registrationStep clause a driver whose documents were rejected (or never
+  // reviewed) kept matching this query and receiving live ride offers, because
+  // rejection doesn't clear driverProfile.isOnline.
   const baseFilter: any = {
-    role: 'driver',
-    isActive: true,
+    ...APPROVED_DRIVER_QUERY,
     'driverProfile.isOnline': true,
   };
   const and: any[] = [];
@@ -1506,21 +1514,14 @@ export const getRides = async (req: AuthRequest, res: Response): Promise<void> =
 export const acceptRide = async (req: AuthRequest, res: Response): Promise<void> => {
   try {
     // Approval gate: only an admin-approved driver may accept a real ride.
-    // `/drivers/registration/step` sets role:'driver' during signup (so a
-    // brand-new account is a "driver" long before vetting), and nothing else
-    // downstream re-checked approval — an unvetted account could go online and
-    // accept live customer rides. Admin approval sets registrationStep:
-    // 'approved' (adminDrivers.ts).
-    const driverUser: any = req.user;
-    if (driverUser?.role !== 'driver') {
-      res.status(403).json({ success: false, message: 'Only drivers can accept rides' });
-      return;
-    }
-    if (driverUser?.driverProfile?.registrationStep !== 'approved') {
-      res.status(403).json({
-        success: false,
-        message: 'Your driver account is pending approval. You cannot accept rides yet.',
-      });
+    // `/drivers/registration/step` sets role:'driver' during signup, so a
+    // brand-new account is a "driver" long before vetting. The reason string
+    // distinguishes rejected (driver must act) from still-under-review (driver
+    // must wait) — one flat "pending approval" line told a rejected driver
+    // nothing about what to fix.
+    const block = driverWorkBlockReason(req.user as any);
+    if (block) {
+      res.status(403).json({ success: false, message: block });
       return;
     }
 
@@ -1647,10 +1648,20 @@ export const getAvailableRides = async (req: AuthRequest, res: Response): Promis
   try {
     const driver = await User.findById(req.user!._id).select(
       '_id role driverProfile.isOnline driverProfile.serviceType ' +
-        'driverProfile.vehicleTypeCode driverProfile.currentLocation',
+        'driverProfile.vehicleTypeCode driverProfile.currentLocation ' +
+        'driverProfile.registrationStep',
     );
     if (!driver || driver.role !== 'driver') {
       res.status(403).json({ success: false, message: 'Drivers only' });
+      return;
+    }
+    // Same approval gate as the dispatch fan-out — otherwise a rejected driver
+    // who was skipped by the socket/FCM push could still pull the very same
+    // offers from here. Empty list rather than a 403: the driver app polls this
+    // every 8s, and the honest explanation belongs on the actions they take
+    // deliberately (toggle-online, accept), not on a background feed.
+    if (driverWorkBlockReason(driver as any)) {
+      res.status(200).json({ success: true, data: { rides: [] } });
       return;
     }
 
@@ -1771,6 +1782,15 @@ export const verifyRideOtp = async (req: AuthRequest, res: Response): Promise<vo
     const { otp } = req.body as { otp?: string };
     if (!otp || !/^\d{4}$/.test(otp)) {
       res.status(400).json({ success: false, message: 'Enter the 4-digit OTP.' });
+      return;
+    }
+    // Starting a trip is work. A driver rejected between accept and pickup
+    // must not carry the passenger. Deliberately NOT applied to
+    // updateRideStatus/settlement: once the trip is under way, blocking those
+    // would strand the passenger mid-journey and leave the fare uncollected.
+    const block = driverWorkBlockReason(req.user as any);
+    if (block) {
+      res.status(403).json({ success: false, message: block });
       return;
     }
 

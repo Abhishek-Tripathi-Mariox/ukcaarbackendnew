@@ -3,6 +3,9 @@ import crypto from 'crypto';
 import Razorpay from 'razorpay';
 import { Payment, Wallet, User, SavedPaymentMethod, RechargeOffer, Ride } from '../models';
 import { AuthRequest } from '../middleware/auth';
+// Shared with the ride/dispatch gates so "approved" means one thing everywhere.
+// Unapproved drivers must not move money — no top-ups, no OnePass, no cashouts.
+import { isUnapprovedDriver } from '../middleware/driverApproval';
 import { config } from '../config';
 
 const razorpay = new Razorpay({
@@ -213,19 +216,6 @@ async function activateOnePassFromPayment(payment: any): Promise<void> {
   });
 }
 
-
-/**
- * True when the caller is a DRIVER whose application isn't approved yet.
- * Unverified drivers must not move money — no wallet top-ups, no OnePass,
- * no cashouts. (Customers are unaffected; the driver app now shows a
- * "verification pending" gate, this is the server-side backstop.)
- */
-async function isUnapprovedDriver(userId: any): Promise<boolean> {
-  const u: any = await User.findById(userId)
-    .select('role driverProfile.registrationStep')
-    .lean();
-  return u?.role === 'driver' && u?.driverProfile?.registrationStep !== 'approved';
-}
 
 export const createOrder = async (req: AuthRequest, res: Response): Promise<void> => {
   try {

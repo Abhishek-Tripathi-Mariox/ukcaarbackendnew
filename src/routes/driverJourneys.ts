@@ -11,6 +11,7 @@ import {
   Settings,
 } from '../models';
 import { authenticate, authorize, AuthRequest } from '../middleware/auth';
+import { requireApprovedDriver } from '../middleware/driverApproval';
 import { config } from '../config';
 import { emitToUser } from '../socket';
 import { distanceMeters } from '../utils/routeCorridor';
@@ -672,8 +673,12 @@ router.get('/:key/passengers', async (req: AuthRequest, res: Response) => {
 /**
  * POST /api/v1/drivers/journeys/:key/start
  * Activate the journey (status -> active, position at the boarding stop).
+ *
+ * Approval-gated: this is where a shuttle run *begins*. The check-in / drop /
+ * complete endpoints below are intentionally left open so a driver rejected
+ * mid-run can still finish the trip they already have passengers on.
  */
-router.post('/:key/start', async (req: AuthRequest, res: Response) => {
+router.post('/:key/start', requireApprovedDriver, async (req: AuthRequest, res: Response) => {
   try {
     const resolved = await resolveJourney(req.params.key, req.user!._id);
     if (!resolved) {

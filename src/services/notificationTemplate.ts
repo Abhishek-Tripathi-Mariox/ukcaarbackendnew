@@ -121,8 +121,13 @@ export async function sendTemplated(
   vars: Record<string, any> = {},
   fallback?: { title: string; body: string; type?: 'ride' | 'payment' | 'promo' | 'safety' | 'system' },
 ): Promise<{ delivered: boolean; usedFallback: boolean }> {
-  const user = await User.findById(userId).select('fcmTokens language');
+  const user = await User.findById(userId).select('fcmTokens language isActive deletedAt');
   if (!user) return { delivered: false, usedFallback: false };
+  // Same safety net as sendPushToUser: a disabled or self-deleted account must
+  // never receive pushes, even if a stale token is still on the record.
+  if (!user.isActive || (user as any).deletedAt) {
+    return { delivered: false, usedFallback: false };
+  }
 
   const locale = (user as any).language || 'en';
   const rendered = await renderTemplate(key, vars, locale);

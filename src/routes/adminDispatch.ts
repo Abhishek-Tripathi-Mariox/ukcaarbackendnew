@@ -2,6 +2,7 @@ import { Router, Request, Response } from 'express';
 import mongoose from 'mongoose';
 import { User, Ride } from '../models';
 import { requirePermission } from '../middleware/auth';
+import { APPROVED_DRIVER_QUERY } from '../middleware/driverApproval';
 import { auditLog } from '../middleware/audit';
 import { PERMISSIONS } from '../config/permissions';
 import { emitToUser } from '../socket';
@@ -122,9 +123,11 @@ router.get(
         return;
       }
 
+      // This is the list an admin assigns from, so it must match what
+      // /dispatch/:rideId/assign will actually accept — an unapproved driver
+      // shown here could only ever fail with "Driver not found".
       const drivers = await User.find({
-        role: 'driver',
-        isActive: true,
+        ...APPROVED_DRIVER_QUERY,
         'driverProfile.isOnline': true,
         'driverProfile.currentLocation.lat': { $ne: null },
         ...(ride.driver ? { _id: { $ne: ride.driver } } : {}),
@@ -216,7 +219,9 @@ router.post(
 
       const [ride, driver] = await Promise.all([
         Ride.findById(rideId),
-        User.findOne({ _id: driverId, role: 'driver', isActive: true }),
+        // APPROVED_DRIVER_QUERY, not just role+isActive: a manual assign was
+        // the one remaining way to put a live ride on an unapproved driver.
+        User.findOne({ _id: driverId, ...APPROVED_DRIVER_QUERY }),
       ]);
 
       if (!ride) {

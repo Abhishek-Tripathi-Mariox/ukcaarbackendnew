@@ -253,6 +253,9 @@ const rejectHandler = async (req: Request, res: Response) => {
         // isActive:false — that blocked OTP login outright, so a rejected
         // driver could never sign in to fix and resubmit their documents.
         'driverProfile.registrationStep': 'rejected',
+        // A driver rejected while online stayed isOnline:true, so they kept
+        // matching the dispatch query and being paged for live rides.
+        'driverProfile.isOnline': false,
         disabledReason: `Application rejected: ${reason}`,
       },
       { new: true },
@@ -499,6 +502,9 @@ router.patch(
         // Surface the rejection as an application-level state so the app flips
         // from "waiting approval" to "fix your documents".
         (driver.driverProfile as any).registrationStep = 'rejected';
+        // Same reason as the application-reject path: an online driver who
+        // loses approval must drop out of dispatch immediately.
+        (driver.driverProfile as any).isOnline = false;
       } else if (normalized === 'verified' && step === 'rejected') {
         // Recovering a rejected application: once the admin re-approves the
         // last outstanding rejected doc, put the driver back in the review

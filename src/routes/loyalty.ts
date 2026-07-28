@@ -1,4 +1,5 @@
 import { Router, Response } from 'express';
+import mongoose from 'mongoose';
 import { authenticate, authorize, AuthRequest } from '../middleware/auth';
 import {
   LoyaltyAccount,
@@ -7,7 +8,7 @@ import {
   LoyaltyReward,
   LoyaltyRedemption,
 } from '../models/Loyalty';
-import { getOrCreateAccount, redeemReward } from '../services/loyaltyEngine';
+import { getOrCreateAccount, redeemReward, LoyaltyError } from '../services/loyaltyEngine';
 
 const router = Router();
 router.use(authenticate);
@@ -78,12 +79,21 @@ router.get('/rewards', async (req: AuthRequest, res: Response) => {
 router.post('/redeem', async (req: AuthRequest, res: Response) => {
   try {
     const { rewardId } = req.body || {};
-    if (!rewardId) return res.status(400).json({ success: false, message: 'rewardId required' });
+    if (typeof rewardId !== 'string' || !mongoose.isValidObjectId(rewardId)) {
+      return res.status(400).json({ success: false, message: 'A valid rewardId is required' });
+    }
     const result = await redeemReward({ userId: req.user!._id, rewardId });
     res.status(201).json({ success: true, data: result });
   } catch (err: any) {
     console.error('[Loyalty redeem] error:', err);
-    res.status(400).json({ success: false, message: err.message || 'Redeem failed' });
+    // Only LoyaltyError carries text written for the customer. Every other
+    // error is internal (cast/DB/network) — never echo its message back.
+    if (err instanceof LoyaltyError) {
+      return res.status(400).json({ success: false, message: err.message });
+    }
+    res
+      .status(500)
+      .json({ success: false, message: 'Could not redeem this reward. Please try again.' });
   }
 });
 

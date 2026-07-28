@@ -1,5 +1,6 @@
 import { Router, Request, Response } from 'express';
 import mongoose from 'mongoose';
+import { APPROVED_DRIVER_QUERY, driverWorkBlockReason } from '../middleware/driverApproval';
 import { istDateStr } from '../utils/date';
 import { User, Ride, Payment, Wallet, Chat, PromoCode, Notification } from '../models';
 import { sendPushToTokens } from '../config/firebase';
@@ -2229,7 +2230,10 @@ router.put('/rides/:id/reassign', requirePermission(PERMISSIONS.MANAGE_RIDES), a
 
     const [ride, newDriver] = await Promise.all([
       Ride.findById(req.params.id),
-      User.findOne({ _id: driverId, role: 'driver', isVerified: true, isActive: true }),
+      // isVerified only means "phone OTP verified" — it never meant the
+      // application was approved, so reassign could hand a live ride to a
+      // driver whose documents were rejected.
+      User.findOne({ _id: driverId, isVerified: true, ...APPROVED_DRIVER_QUERY }),
     ]);
 
     if (!ride) {
@@ -2322,8 +2326,9 @@ router.get('/rides/:id/nearby-drivers', requirePermission(PERMISSIONS.MANAGE_RID
     // existing dispatch path ignores it, see the comment in
     // vehicleTypeController.listNearbyVehicleTypes).
     const baseFilter: any = {
-      role: 'driver',
-      isActive: true,
+      // Only drivers cleared to work are offerable — the picker used to list
+      // rejected/pending drivers as assignable candidates.
+      ...APPROVED_DRIVER_QUERY,
       'driverProfile.isOnline': true,
     };
     if (q) {
@@ -2418,17 +2423,26 @@ router.post('/rides/:id/assign-driver', requirePermission(PERMISSIONS.MANAGE_RID
       return;
     }
 
-    // Driver actually exists? If not, roll back to searching so we don't
-    // strand the ride with a phantom driver.
+    // Driver exists AND is cleared to work? The ride was already claimed above,
+    // so anything that disqualifies the driver must roll the claim back —
+    // otherwise a rejected/pending/suspended driver keeps a live ride.
     const driver = await User.findOne({ _id: driverId, role: 'driver' }).select(
-      '_id firstName lastName phone avatar driverProfile',
+      '_id firstName lastName phone avatar role isActive driverProfile',
     );
-    if (!driver) {
+    const blockReason = driver
+      ? driver.isActive === false
+        ? 'This driver is suspended and cannot be assigned rides.'
+        : driverWorkBlockReason(driver as any)
+      : null;
+    if (!driver || blockReason) {
       await Ride.updateOne(
         { _id: claimed._id },
         { $unset: { driver: '' }, $set: { status: 'searching' } },
       );
-      res.status(404).json({ success: false, message: 'Driver not found' });
+      res.status(!driver ? 404 : 403).json({
+        success: false,
+        message: !driver ? 'Driver not found' : blockReason!,
+      });
       return;
     }
 
@@ -3935,7 +3949,11 @@ router.post('/broadcast', requirePermission(PERMISSIONS.SEND_NOTIFICATIONS), aud
 
     // 'all' means customers + drivers; admin accounts should not receive
     // marketing/ops broadcasts.
-    const filter: Record<string, any> = { isActive: true, role: { $in: ['customer', 'driver'] } };
+    const filter: Record<string, any> = {
+      isActive: true,
+      deletedAt: { $exists: false },
+      role: { $in: ['customer', 'driver'] },
+    };
     if (targetRole) filter.role = targetRole;
     if (targetUserIds?.length) filter._id = { $in: targetUserIds };
 
@@ -4080,9 +4098,16 @@ router.post('/notify/:userId', requirePermission(PERMISSIONS.SEND_NOTIFICATIONS)
       return;
     }
 
-    const user = await User.findById(req.params.userId).select('_id fcmTokens');
+    const user = await User.findById(req.params.userId).select('_id fcmTokens isActive deletedAt');
     if (!user) {
       res.status(404).json({ success: false, message: 'User not found' });
+      return;
+    }
+    // A self-deleted account must never receive pushes. Suspended-but-present
+    // accounts are still notifiable — an admin may legitimately want to tell
+    // them why they were suspended.
+    if ((user as any).deletedAt) {
+      res.status(400).json({ success: false, message: 'This account has been deleted.' });
       return;
     }
 

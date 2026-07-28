@@ -1,6 +1,10 @@
 import { Response } from 'express';
 import { Route } from '../models';
 import { AuthRequest } from '../middleware/auth';
+import {
+  APPROVED_DRIVER_QUERY,
+  isUnapprovedDriver,
+} from '../middleware/driverApproval';
 import { distanceMeters } from '../utils/routeCorridor';
 import { istDateStr, istDateStrPlusDays, istMinutesOfDay } from '../utils/date';
 import { emitToUser } from '../socket';
@@ -608,7 +612,15 @@ export const getRouteVehicles = async (
     const driverIds = approved.map((d: any) => d.driver).filter(Boolean);
     const { User, ScheduledBooking } = await import('../models');
 
-    const drivers = await User.find({ _id: { $in: driverIds } })
+    // Route-level `status: 'approved'` only means the admin approved this
+    // driver for this route — it does NOT track the account. A driver whose
+    // documents were later rejected kept appearing here as a bookable vehicle,
+    // so re-check the account itself. Non-matching drivers fall out below via
+    // the `driverById.has(...)` filter.
+    const drivers = await User.find({
+      _id: { $in: driverIds },
+      ...APPROVED_DRIVER_QUERY,
+    })
       .select(
         'firstName lastName avatar driverProfile.rating driverProfile.totalTrips ' +
           'driverProfile.vehicleMake driverProfile.vehicleModel driverProfile.vehicleColor ' +
@@ -803,6 +815,16 @@ export const bookRouteSeats = async (
         (d.departureIndex == null || d.departureIndex === departureIndex),
     );
     if (!servesTrip) {
+      res.status(400).json({
+        success: false,
+        message: 'Selected vehicle is not available for this trip',
+      });
+      return;
+    }
+    // Backstop for a stale client: the route registration can still say
+    // 'approved' after the driver's *account* was rejected, and this endpoint
+    // is what actually hands them a paying passenger.
+    if (await isUnapprovedDriver(driverId)) {
       res.status(400).json({
         success: false,
         message: 'Selected vehicle is not available for this trip',

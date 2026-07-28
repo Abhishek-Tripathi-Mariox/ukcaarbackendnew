@@ -4,6 +4,7 @@ import { createClient } from 'redis';
 import { createAdapter } from '@socket.io/redis-adapter';
 import jwt from 'jsonwebtoken';
 import { User } from '../models';
+import { APPROVED_DRIVER_QUERY } from '../middleware/driverApproval';
 import config from '../config';
 import { redisSocketOptions } from '../config/redis';
 
@@ -406,7 +407,10 @@ export const emitToOnlineDrivers = (event: string, data: any) => {
 export const notifyNearbyDrivers = async (rideId: string, pickup: { lat: number; lng: number }, radiusKm: number = 5) => {
   try {
     const nearbyDrivers = await User.find({
-      role: 'driver',
+      // Second emitter of 'ride:new-request' (currently unused — the live
+      // fan-out is rideController.dispatchToNearbyDrivers). Carries the same
+      // approval gate so wiring it up can't reopen the hole.
+      ...APPROVED_DRIVER_QUERY,
       'driverProfile.isOnline': true,
       'driverProfile.isAvailable': true,
       'driverProfile.currentLocation': {

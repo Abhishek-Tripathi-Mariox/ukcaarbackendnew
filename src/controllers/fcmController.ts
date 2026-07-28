@@ -81,11 +81,22 @@ export const unregisterFcmToken = async (req: AuthRequest, res: Response): Promi
  * Sends a push to all of a user's registered devices and prunes invalid tokens.
  */
 export async function sendPushToUser(userId: string, payload: PushPayload): Promise<void> {
-  const user = await User.findById(userId).select('fcmTokens');
+  const user = await User.findById(userId).select('fcmTokens isActive deletedAt');
   if (!user || user.fcmTokens.length === 0) {
     console.log(
       `[fcm] sendPushToUser user=${userId} skipped: ` +
         (!user ? 'user not found' : 'no fcmTokens registered'),
+    );
+    return;
+  }
+
+  // Safety net for tokens that outlive the account: a disabled/self-deleted
+  // user must never get pushes, even if a stale token is still on the record
+  // (e.g. logout ran offline and the unregister call never reached us).
+  if (!user.isActive || user.deletedAt) {
+    console.log(
+      `[fcm] sendPushToUser user=${userId} skipped: ` +
+        (user.deletedAt ? 'account deleted' : 'account inactive'),
     );
     return;
   }

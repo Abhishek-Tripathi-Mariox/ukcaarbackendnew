@@ -17,6 +17,19 @@ import mongoose from 'mongoose';
 const POINTS_PER_RUPEE = Number(process.env.LOYALTY_POINTS_PER_RUPEE ?? 0.1);
 
 /**
+ * A business-rule failure the customer can act on (not enough points, reward
+ * expired, limit reached). Its `message` is written for the end user, so
+ * routes may return it verbatim — unlike any other thrown error, whose text
+ * is internal (Mongoose casts, DB failures) and must never reach the client.
+ */
+export class LoyaltyError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'LoyaltyError';
+  }
+}
+
+/**
  * Get-or-create loyalty account for a customer.
  */
 export async function getOrCreateAccount(
@@ -69,7 +82,7 @@ export async function addTransaction(args: {
 }): Promise<{ account: ILoyaltyAccount; txnId: mongoose.Types.ObjectId }> {
   const acct = await getOrCreateAccount(args.userId);
   const newBalance = acct.pointsBalance + args.points;
-  if (newBalance < 0) throw new Error('Insufficient points');
+  if (newBalance < 0) throw new LoyaltyError('Insufficient points');
 
   acct.pointsBalance = newBalance;
   if (args.points > 0) {
@@ -142,28 +155,29 @@ export async function redeemReward(args: {
   fulfilled: 'wallet' | 'voucher';
 }> {
   const reward = (await LoyaltyReward.findById(args.rewardId)) as ILoyaltyReward | null;
-  if (!reward) throw new Error('Reward not found');
-  if (!reward.active) throw new Error('Reward not active');
+  if (!reward) throw new LoyaltyError('Reward not found');
+  if (!reward.active) throw new LoyaltyError('Reward not active');
 
   const now = new Date();
-  if (reward.validFrom && now < reward.validFrom) throw new Error('Reward not yet available');
-  if (reward.validUntil && now > reward.validUntil) throw new Error('Reward expired');
+  if (reward.validFrom && now < reward.validFrom) throw new LoyaltyError('Reward not yet available');
+  if (reward.validUntil && now > reward.validUntil) throw new LoyaltyError('Reward expired');
 
   if (
     reward.totalRedemptionLimit &&
     reward.totalRedemptionsCount >= reward.totalRedemptionLimit
   ) {
-    throw new Error('Reward limit reached');
+    throw new LoyaltyError('Reward limit reached');
   }
 
   const acct = await getOrCreateAccount(args.userId);
 
-  // Tier gate
-  if (reward.minTierKey) {
-    const minTier = await LoyaltyTier.findOne({ key: reward.minTierKey }).lean();
+  // Tier gate. The admin PATCH route writes whatever it is given to
+  // `minTierKey`, so coerce to a string before it reaches a String query path.
+  if (typeof reward.minTierKey === 'string' && reward.minTierKey.trim()) {
+    const minTier = await LoyaltyTier.findOne({ key: reward.minTierKey.trim() }).lean();
     if (minTier) {
       if (!acct.lifetimePoints || acct.lifetimePoints < minTier.minLifetimePoints) {
-        throw new Error(`Requires ${minTier.name} tier`);
+        throw new LoyaltyError(`Requires ${minTier.name} tier`);
       }
     }
   }
@@ -176,12 +190,12 @@ export async function redeemReward(args: {
       status: { $ne: 'cancelled' },
     });
     if (count >= reward.maxRedemptionsPerUser) {
-      throw new Error('Per-user redemption limit reached');
+      throw new LoyaltyError('Per-user redemption limit reached');
     }
   }
 
   if (acct.pointsBalance < reward.pointsCost) {
-    throw new Error('Insufficient points');
+    throw new LoyaltyError('Insufficient points');
   }
 
   // Debit the points cost.

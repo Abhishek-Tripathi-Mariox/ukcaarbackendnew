@@ -2,6 +2,7 @@ import { Response } from 'express';
 import mongoose from 'mongoose';
 import { User, Ride, Payment, Route } from '../models';
 import { AuthRequest } from '../middleware/auth';
+import { driverWorkBlockReason } from '../middleware/driverApproval';
 import { config } from '../config';
 import { createOrder } from './paymentController';
 
@@ -140,6 +141,20 @@ export const updateRegistrationStep = async (
 export const toggleOnline = async (req: AuthRequest, res: Response): Promise<void> => {
   try {
     const { isOnline, lat, lng } = req.body;
+
+    // Only an approved driver may be online. Note we force isOnline:false
+    // rather than just refusing: a driver who was online when the admin
+    // rejected them keeps isOnline:true in the DB (reject doesn't clear it),
+    // and dispatch would keep matching them. Any toggle attempt now settles
+    // that row to offline.
+    const block = driverWorkBlockReason(req.user as any);
+    if (block) {
+      await User.findByIdAndUpdate(req.user!._id, {
+        'driverProfile.isOnline': false,
+      });
+      res.status(403).json({ success: false, message: block, data: { isOnline: false } });
+      return;
+    }
 
     const updateData: Record<string, any> = {
       'driverProfile.isOnline': isOnline,

@@ -201,15 +201,25 @@ const approveHandler = async (req: Request, res: Response) => {
       res.status(404).json({ success: false, message: 'Driver not found' });
       return;
     }
+    const approvedCopy = await (await import('../services/notificationTemplate')).templatedCopy(
+      'application.approved',
+      {},
+      { title: 'Application Approved', body: "Congratulations! You're approved. Tap to start driving." },
+      (driver as any).language,
+    );
     sendPushToUser(driver._id.toString(), {
-      title: 'Application Approved',
-      body: "Congratulations! You're approved. Tap to start driving.",
+      title: approvedCopy.title,
+      body: approvedCopy.body,
       data: { kind: 'application:approved' },
     }).catch((e) => console.warn('[approve] push failed:', e));
     await Notification.create({
       user: driver._id,
-      title: 'You are approved!',
-      body: 'Your driver application has been approved. Go online to start receiving bookings.',
+      // Same rendered copy when a template exists; the legacy in-app wording
+      // otherwise, so nothing shifts until an admin authors the template.
+      title: approvedCopy.usedTemplate ? approvedCopy.title : 'You are approved!',
+      body: approvedCopy.usedTemplate
+        ? approvedCopy.body
+        : 'Your driver application has been approved. Go online to start receiving bookings.',
       type: 'system',
     }).catch(() => {});
     emitToUser(driver._id.toString(), 'application:approved', {
@@ -255,15 +265,23 @@ const rejectHandler = async (req: Request, res: Response) => {
       reason,
       message: `Your driver application was not approved. Reason: ${reason}`,
     });
+    const rejectedCopy = await (await import('../services/notificationTemplate')).templatedCopy(
+      'application.rejected',
+      { reason },
+      { title: 'Application update', body: `Your application was not approved: ${reason}. Fix your documents and resubmit.` },
+      (driver as any).language,
+    );
     sendPushToUser(driver._id.toString(), {
-      title: 'Application update',
-      body: `Your application was not approved: ${reason}. Fix your documents and resubmit.`,
+      title: rejectedCopy.title,
+      body: rejectedCopy.body,
       data: { kind: 'document:rejected' },
     }).catch((e) => console.warn('[reject] push failed:', e));
     await Notification.create({
       user: driver._id,
-      title: 'Application not approved',
-      body: `Reason: ${reason}. Update your documents from Profile → Documents and resubmit.`,
+      title: rejectedCopy.usedTemplate ? rejectedCopy.title : 'Application not approved',
+      body: rejectedCopy.usedTemplate
+        ? rejectedCopy.body
+        : `Reason: ${reason}. Update your documents from Profile → Documents and resubmit.`,
       type: 'system',
     }).catch(() => {});
     res.status(200).json({ success: true, message: 'Application rejected' });
@@ -509,15 +527,21 @@ router.patch(
       // Out-of-band push too — driver may not have the app open. Verified is
       // a quiet status update; rejection is the actionable one.
       if (normalized === 'rejected') {
+        const docCopy = await (await import('../services/notificationTemplate')).templatedCopy(
+          'document.rejected',
+          { documentType: req.params.documentType, note: message },
+          { title: 'Document needs re-upload', body: message },
+          (driver as any).language,
+        );
         await Notification.create({
           user: driver._id,
-          title: 'Document needs re-upload',
-          body: message,
+          title: docCopy.title,
+          body: docCopy.body,
           type: 'system',
         }).catch(() => {});
         sendPushToUser(driver._id.toString(), {
-          title: 'Document needs re-upload',
-          body: message,
+          title: docCopy.title,
+          body: docCopy.body,
           data: {
             kind: 'document:rejected',
             documentType: req.params.documentType,

@@ -393,11 +393,25 @@ async function dispatchToNearbyDrivers(ride: any): Promise<void> {
 
   // FCM: every nearby driver, in parallel. Failures per-driver are logged
   // by sendPushToUser and don't abort the rest of the fan-out.
+  const { templatedCopy } = await import('../services/notificationTemplate');
+  const requestCopy = await templatedCopy(
+    'ride.new_request',
+    {
+      tier: expectedTier,
+      customerName,
+      pickup: ride.pickup.address.slice(0, 40),
+      dropoff: ride.dropoff.address.slice(0, 40),
+    },
+    {
+      title: `New ${expectedTier} ride request`,
+      body: `${customerName} · ${ride.pickup.address.slice(0, 40)} → ${ride.dropoff.address.slice(0, 40)}`,
+    },
+  );
   await Promise.all(
     nearbyDrivers.map(driver =>
       sendPushToUser(driver._id.toString(), {
-        title: `New ${expectedTier} ride request`,
-        body: `${customerName} · ${ride.pickup.address.slice(0, 40)} → ${ride.dropoff.address.slice(0, 40)}`,
+        title: requestCopy.title,
+        body: requestCopy.body,
         data: {
           kind: 'ride:new-request',
           ...Object.fromEntries(
@@ -1560,9 +1574,14 @@ export const acceptRide = async (req: AuthRequest, res: Response): Promise<void>
       ? { ...ride.toObject(), pickupOtp: undefined }
       : ride;
     // Push fallback in case the customer app is backgrounded.
+    const assignedCopy = await (await import('../services/notificationTemplate')).templatedCopy(
+      'ride.driver_assigned',
+      { driverName: (req.user as any)?.firstName ?? 'Your driver', assignedBy: 'driver' },
+      { title: 'Driver on the way', body: 'Your ride has been accepted. Tap to track.' },
+    );
     sendPushToUser(String(claimed.customer), {
-      title: 'Driver on the way',
-      body: `Your ride has been accepted. Tap to track.`,
+      title: assignedCopy.title,
+      body: assignedCopy.body,
       data: { kind: 'ride:driver-assigned', rideId: String(claimed._id) },
     }).catch(err => console.warn('[ride-accept] push failed:', err));
 

@@ -3,11 +3,42 @@ import { NotificationTemplate, User } from '../models';
 import { authenticate, authorize, requirePermission } from '../middleware/auth';
 import { auditLog } from '../middleware/audit';
 import { PERMISSIONS } from '../config/permissions';
-import { renderString, sendTemplated } from '../services/notificationTemplate';
+import { renderString, sendTemplated, TEMPLATE_REGISTRY } from '../services/notificationTemplate';
 
 const router = Router();
 router.use(authenticate);
 router.use(authorize('admin'));
+
+/**
+ * GET /admin/notification-templates/registry
+ * The template keys the backend actually consults (with their variables), so
+ * admins author templates against real keys instead of guessing. Registered
+ * before the parameterised routes so '/registry' can't be captured as an :id.
+ */
+router.get(
+  '/notification-templates/registry',
+  requirePermission(PERMISSIONS.VIEW_NOTIFICATION_TEMPLATES),
+  async (_req: Request, res: Response) => {
+    // Annotate each key with whether a template already exists for it.
+    const existing = await NotificationTemplate.find({})
+      .select('key isActive')
+      .lean();
+    const byKey = new Map<string, boolean>();
+    existing.forEach((t: any) => {
+      byKey.set(t.key, byKey.get(t.key) || !!t.isActive);
+    });
+    res.json({
+      success: true,
+      data: {
+        registry: TEMPLATE_REGISTRY.map((r) => ({
+          ...r,
+          hasTemplate: byKey.has(r.key),
+          hasActiveTemplate: byKey.get(r.key) === true,
+        })),
+      },
+    });
+  },
+);
 
 /**
  * GET /admin/notification-templates

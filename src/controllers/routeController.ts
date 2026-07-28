@@ -1186,9 +1186,19 @@ export const requestEarlyDrop = async (
     } catch { /* best-effort */ }
     try {
       const { sendPushToUser } = await import('./fcmController');
+      const { templatedCopy } = await import('../services/notificationTemplate');
+      const seatList = (booking.seats ?? []).join(', ');
+      const dropCopy = await templatedCopy(
+        'scheduled.early_drop_request',
+        { customerName, seats: seatList },
+        {
+          title: 'Early drop requested',
+          body: `${customerName} (Seat ${seatList}) is asking to get off early.`,
+        },
+      );
       await sendPushToUser(String(booking.driver), {
-        title: 'Early drop requested',
-        body: `${customerName} (Seat ${(booking.seats ?? []).join(', ')}) is asking to get off early.`,
+        title: dropCopy.title,
+        body: dropCopy.body,
         data: { kind: 'scheduled:early-drop-request', bookingId: String(booking._id) },
       });
     } catch { /* best-effort */ }

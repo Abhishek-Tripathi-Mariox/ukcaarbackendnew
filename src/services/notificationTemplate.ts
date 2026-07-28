@@ -57,6 +57,56 @@ export async function renderTemplate(
 }
 
 /**
+ * Copy-only template hook for EXISTING notification sites. Returns the
+ * rendered title/body when an active template exists for `key`, else the
+ * supplied fallback (today's hardcoded copy) — so wiring a site changes
+ * nothing until an admin actually creates the template. Delivery stays with
+ * the call site: data payloads like kind:'ride:new-request' drive app
+ * routing and must not be altered by templating.
+ */
+export async function templatedCopy(
+  key: string,
+  vars: Record<string, any>,
+  fallback: { title: string; body: string },
+  locale: string = 'en',
+): Promise<{ title: string; body: string; usedTemplate: boolean }> {
+  try {
+    const rendered = await renderTemplate(key, vars, locale);
+    if (rendered) return { title: rendered.title, body: rendered.body, usedTemplate: true };
+  } catch {
+    // Template lookup must never break a production notification.
+  }
+  return { ...fallback, usedTemplate: false };
+}
+
+/**
+ * Every template key the backend consults, with the variables each exposes.
+ * Served to the admin panel (GET /admin/notification-templates/registry) so
+ * admins create templates against real keys instead of guessing.
+ */
+export const TEMPLATE_REGISTRY: {
+  key: string;
+  audience: 'customer' | 'driver';
+  description: string;
+  variables: string[];
+}[] = [
+  { key: 'ride.new_request', audience: 'driver', description: 'New ride request offered to nearby drivers', variables: ['tier', 'customerName', 'pickup', 'dropoff'] },
+  { key: 'ride.driver_assigned', audience: 'customer', description: 'A driver accepted / was assigned to the ride', variables: ['driverName', 'assignedBy'] },
+  { key: 'ride.admin_assigned', audience: 'driver', description: 'Admin assigned a ride directly to the driver', variables: ['pickup'] },
+  { key: 'ride.driver_arrived', audience: 'customer', description: 'Driver reached the pickup point', variables: [] },
+  { key: 'ride.started', audience: 'customer', description: 'Trip started (admin OTP verify)', variables: [] },
+  { key: 'ride.started_driver', audience: 'driver', description: 'Trip started (admin OTP verify), driver copy', variables: [] },
+  { key: 'ride.completed', audience: 'customer', description: 'Ride completed (admin path)', variables: ['fare'] },
+  { key: 'ride.completed_driver', audience: 'driver', description: 'Ride completed, earnings credited (admin path)', variables: ['earnings'] },
+  { key: 'application.approved', audience: 'driver', description: 'Driver application approved', variables: [] },
+  { key: 'application.rejected', audience: 'driver', description: 'Driver application rejected', variables: ['reason'] },
+  { key: 'document.rejected', audience: 'driver', description: 'A driver document was rejected for re-upload', variables: ['documentType', 'note'] },
+  { key: 'scheduled.early_drop_request', audience: 'driver', description: 'Customer asked to leave the shuttle early', variables: ['customerName', 'seats'] },
+  { key: 'scheduled.early_drop_approved', audience: 'customer', description: 'Driver approved the early drop', variables: ['refund'] },
+  { key: 'scheduled.early_drop_declined', audience: 'customer', description: 'Driver declined the early drop', variables: ['reason'] },
+];
+
+/**
  * Render a template and dispatch it to a user across the configured channels:
  *   - "inapp": persist a Notification doc + emit a socket event
  *   - "push": fan out FCM

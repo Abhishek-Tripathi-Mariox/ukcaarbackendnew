@@ -2450,11 +2450,19 @@ router.post('/rides/:id/assign-driver', requirePermission(PERMISSIONS.MANAGE_RID
     // Same event the regular accept flow emits. The customer's FindingDriver
     // screen already listens for this and navigates to RideTracking.
     emitToUser(String(claimed.customer), 'ride:driver-assigned', { ride });
-    sendPushToUser(String(claimed.customer), {
-      title: 'Driver assigned',
-      body: 'Your ride has been assigned. Tap to track.',
-      data: { kind: 'ride:driver-assigned', rideId: String(claimed._id) },
-    }).catch(err => console.warn('[admin-assign] customer push failed:', err));
+    {
+      const { templatedCopy } = await import('../services/notificationTemplate');
+      const c = await templatedCopy(
+        'ride.driver_assigned',
+        { driverName: 'Your driver', assignedBy: 'admin' },
+        { title: 'Driver assigned', body: 'Your ride has been assigned. Tap to track.' },
+      );
+      sendPushToUser(String(claimed.customer), {
+        title: c.title,
+        body: c.body,
+        data: { kind: 'ride:driver-assigned', rideId: String(claimed._id) },
+      }).catch(err => console.warn('[admin-assign] customer push failed:', err));
+    }
 
     // ── Driver side ──────────────────────────────────────────────────
     // The dispatch path (`ride:new-request`) shows the accept/reject modal.
@@ -2471,15 +2479,24 @@ router.post('/rides/:id/assign-driver', requirePermission(PERMISSIONS.MANAGE_RID
       assignedBy: 'admin',
       message: 'Admin has assigned you a new ride.',
     });
-    sendPushToUser(String(driverId), {
-      title: 'New ride assigned',
-      body: `Pickup: ${ride?.pickup?.address?.slice(0, 50) ?? 'See app'}`,
-      data: {
-        kind: 'ride:assigned',
-        rideId: String(claimed._id),
-      },
-      android: { channelId: 'ukcaar_ride_alerts', priority: 'high' as const },
-    }).catch(err => console.warn('[admin-assign] driver push failed:', err));
+    {
+      const { templatedCopy } = await import('../services/notificationTemplate');
+      const pickupShort = ride?.pickup?.address?.slice(0, 50) ?? 'See app';
+      const c = await templatedCopy(
+        'ride.admin_assigned',
+        { pickup: pickupShort },
+        { title: 'New ride assigned', body: `Pickup: ${pickupShort}` },
+      );
+      sendPushToUser(String(driverId), {
+        title: c.title,
+        body: c.body,
+        data: {
+          kind: 'ride:assigned',
+          rideId: String(claimed._id),
+        },
+        android: { channelId: 'ukcaar_ride_alerts', priority: 'high' as const },
+      }).catch(err => console.warn('[admin-assign] driver push failed:', err));
+    }
 
     res.status(200).json({
       success: true,
@@ -2554,17 +2571,28 @@ router.post('/rides/:id/verify-otp', requirePermission(PERMISSIONS.MANAGE_RIDES)
 
     // Push notifications for both parties so the apps wake even if
     // backgrounded.
-    sendPushToUser(String(ride.customer), {
-      title: 'Trip started',
-      body: 'Your driver has started the trip. Sit back and enjoy the ride.',
-      data: { kind: 'ride:status', rideId: String(ride._id), status: 'in_progress' },
-    }).catch(err => console.warn('[admin-verify-otp] customer push failed:', err));
-    if (ride.driver) {
-      sendPushToUser(String(ride.driver), {
+    {
+      const { templatedCopy } = await import('../services/notificationTemplate');
+      const cCust = await templatedCopy('ride.started', {}, {
         title: 'Trip started',
-        body: 'Trip has been verified and started by admin.',
+        body: 'Your driver has started the trip. Sit back and enjoy the ride.',
+      });
+      sendPushToUser(String(ride.customer), {
+        title: cCust.title,
+        body: cCust.body,
         data: { kind: 'ride:status', rideId: String(ride._id), status: 'in_progress' },
-      }).catch(err => console.warn('[admin-verify-otp] driver push failed:', err));
+      }).catch(err => console.warn('[admin-verify-otp] customer push failed:', err));
+      if (ride.driver) {
+        const cDrv = await templatedCopy('ride.started_driver', {}, {
+          title: 'Trip started',
+          body: 'Trip has been verified and started by admin.',
+        });
+        sendPushToUser(String(ride.driver), {
+          title: cDrv.title,
+          body: cDrv.body,
+          data: { kind: 'ride:status', rideId: String(ride._id), status: 'in_progress' },
+        }).catch(err => console.warn('[admin-verify-otp] driver push failed:', err));
+      }
     }
 
     res.status(200).json({ success: true, data: { ride: populated }, message: 'Ride started' });
@@ -2695,17 +2723,30 @@ router.post('/rides/:id/complete', requirePermission(PERMISSIONS.MANAGE_RIDES), 
     emitToUser(String(ride.customer), 'ride:status', statusPayload);
     if (ride.driver) emitToUser(String(ride.driver), 'ride:status', statusPayload);
 
-    sendPushToUser(String(ride.customer), {
-      title: 'Ride completed',
-      body: `Trip complete. Fare: ₹${ride.actualFare.toFixed(2)}`,
-      data: { kind: 'ride:status', rideId: String(ride._id), status: 'completed' },
-    }).catch(err => console.warn('[admin-complete] customer push failed:', err));
-    if (ride.driver) {
-      sendPushToUser(String(ride.driver), {
+    {
+      const { templatedCopy } = await import('../services/notificationTemplate');
+      const fareText = ride.actualFare.toFixed(2);
+      const cCust = await templatedCopy('ride.completed', { fare: fareText }, {
         title: 'Ride completed',
-        body: `Earnings credited: ₹${(ride.driverEarnings || 0).toFixed(2)}`,
+        body: `Trip complete. Fare: ₹${fareText}`,
+      });
+      sendPushToUser(String(ride.customer), {
+        title: cCust.title,
+        body: cCust.body,
         data: { kind: 'ride:status', rideId: String(ride._id), status: 'completed' },
-      }).catch(err => console.warn('[admin-complete] driver push failed:', err));
+      }).catch(err => console.warn('[admin-complete] customer push failed:', err));
+      if (ride.driver) {
+        const earningsText = (ride.driverEarnings || 0).toFixed(2);
+        const cDrv = await templatedCopy('ride.completed_driver', { earnings: earningsText }, {
+          title: 'Ride completed',
+          body: `Earnings credited: ₹${earningsText}`,
+        });
+        sendPushToUser(String(ride.driver), {
+          title: cDrv.title,
+          body: cDrv.body,
+          data: { kind: 'ride:status', rideId: String(ride._id), status: 'completed' },
+        }).catch(err => console.warn('[admin-complete] driver push failed:', err));
+      }
     }
 
     res.status(200).json({ success: true, data: { ride: populated }, message: 'Ride completed' });

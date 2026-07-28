@@ -199,9 +199,15 @@ export const initializeSocket = (httpServer: HttpServer): SocketServer => {
                 // (which transitively depends on models) at load time.
                 if (nextStatus === 'driver_arrived') {
                   const { sendPushToUser } = await import('../controllers/fcmController');
+                  const { templatedCopy } = await import('../services/notificationTemplate');
+                  const arrivedCopy = await templatedCopy(
+                    'ride.driver_arrived',
+                    {},
+                    { title: 'Your driver has arrived', body: 'They are waiting at your pickup point.' },
+                  );
                   sendPushToUser(String(activeRide.customer), {
-                    title: 'Your driver has arrived',
-                    body: 'They are waiting at your pickup point.',
+                    title: arrivedCopy.title,
+                    body: arrivedCopy.body,
                     data: {
                       kind: 'ride:status',
                       rideId: String(activeRide._id),

@@ -329,11 +329,20 @@ router.post('/early-drop/:bookingId/approve', async (req: AuthRequest, res: Resp
     } catch { /* best-effort */ }
     try {
       const { sendPushToUser } = await import('../controllers/fcmController');
+      const { templatedCopy } = await import('../services/notificationTemplate');
+      const approvedCopy = await templatedCopy(
+        'scheduled.early_drop_approved',
+        { refund: fare.refund },
+        {
+          title: 'Early drop approved',
+          body: fare.refund > 0
+            ? `The driver will stop at the next safe point. ₹${fare.refund} will be refunded.`
+            : 'The driver will stop at the next safe point.',
+        },
+      );
       await sendPushToUser(customerId, {
-        title: 'Early drop approved',
-        body: fare.refund > 0
-          ? `The driver will stop at the next safe point. ₹${fare.refund} will be refunded.`
-          : 'The driver will stop at the next safe point.',
+        title: approvedCopy.title,
+        body: approvedCopy.body,
         data: { kind: 'scheduled:early-drop-approved', bookingId: String(booking._id) },
       });
     } catch { /* best-effort */ }
@@ -390,9 +399,15 @@ router.post('/early-drop/:bookingId/decline', async (req: AuthRequest, res: Resp
     } catch { /* best-effort */ }
     try {
       const { sendPushToUser } = await import('../controllers/fcmController');
+      const { templatedCopy } = await import('../services/notificationTemplate');
+      const declinedCopy = await templatedCopy(
+        'scheduled.early_drop_declined',
+        { reason },
+        { title: 'Early drop not possible right now', body: reason },
+      );
       await sendPushToUser(customerId, {
-        title: 'Early drop not possible right now',
-        body: reason,
+        title: declinedCopy.title,
+        body: declinedCopy.body,
         data: { kind: 'scheduled:early-drop-declined', bookingId: String(booking._id) },
       });
     } catch { /* best-effort */ }

@@ -1,6 +1,7 @@
 import { Router, Request, Response } from 'express';
 import { authenticate } from '../middleware/auth';
 import { config } from '../config';
+import { getRoute } from '../services/routing';
 
 /**
  * Geo proxy. Prefers Google Places when GOOGLE_MAPS_API_KEY is configured
@@ -564,116 +565,14 @@ router.get('/directions', async (req: Request, res: Response) => {
       return;
     }
 
-    // Google encoded polyline → [{lat,lng}, …]. Algorithm: ascii85-ish var-int
-    // signed delta encoding. Lifted from Google's spec; small enough to inline
-    // rather than pull a dep.
-    const decodePolyline = (str: string): Array<{ lat: number; lng: number }> => {
-      const points: Array<{ lat: number; lng: number }> = [];
-      let index = 0;
-      let lat = 0;
-      let lng = 0;
-      while (index < str.length) {
-        let b: number;
-        let shift = 0;
-        let result = 0;
-        do {
-          b = str.charCodeAt(index++) - 63;
-          result |= (b & 0x1f) << shift;
-          shift += 5;
-        } while (b >= 0x20);
-        const dLatEnc = result & 1 ? ~(result >> 1) : result >> 1;
-        lat += dLatEnc;
-        shift = 0;
-        result = 0;
-        do {
-          b = str.charCodeAt(index++) - 63;
-          result |= (b & 0x1f) << shift;
-          shift += 5;
-        } while (b >= 0x20);
-        const dLngEnc = result & 1 ? ~(result >> 1) : result >> 1;
-        lng += dLngEnc;
-        points.push({ lat: lat / 1e5, lng: lng / 1e5 });
-      }
-      return points;
-    };
-
-    // ── Provider 1: Google Directions ──────────────────────────────────
-    const gKey = googleKey();
-    if (gKey) {
-      try {
-        const u = new URL('https://maps.googleapis.com/maps/api/directions/json');
-        u.searchParams.set('origin', `${oLat},${oLng}`);
-        u.searchParams.set('destination', `${dLat},${dLng}`);
-        u.searchParams.set('mode', 'driving');
-        u.searchParams.set('key', gKey);
-        const r = await fetch(u.toString());
-        const j: any = await r.json();
-        if (j?.status === 'OK' && j.routes?.[0]) {
-          const route = j.routes[0];
-          const poly = decodePolyline(route.overview_polyline?.points ?? '');
-          const leg = route.legs?.[0] ?? {};
-          res.status(200).json({
-            success: true,
-            data: {
-              provider: 'google',
-              polyline: poly,
-              distanceMeters: leg.distance?.value ?? 0,
-              durationSeconds: leg.duration?.value ?? 0,
-            },
-          });
-          return;
-        }
-        console.warn('[geo] google directions fallback:', j?.status, j?.error_message);
-      } catch (gErr) {
-        console.warn('[geo] google directions error, falling back:', gErr);
-      }
-    }
-
-    // ── Provider 2: OSRM public router (free, demo-grade) ──────────────
-    try {
-      const osrmUrl =
-        `https://router.project-osrm.org/route/v1/driving/` +
-        `${oLng},${oLat};${dLng},${dLat}?overview=full&geometries=geojson`;
-      const r = await fetch(osrmUrl);
-      const j: any = await r.json();
-      if (j?.code === 'Ok' && j.routes?.[0]) {
-        const route = j.routes[0];
-        const coords: Array<[number, number]> = route.geometry?.coordinates ?? [];
-        const poly = coords.map(([lng, lat]) => ({ lat, lng }));
-        res.status(200).json({
-          success: true,
-          data: {
-            provider: 'osrm',
-            polyline: poly,
-            distanceMeters: route.distance ?? 0,
-            durationSeconds: route.duration ?? 0,
-          },
-        });
-        return;
-      }
-    } catch (osrmErr) {
-      console.warn('[geo] osrm directions error:', osrmErr);
-    }
-
-    // ── Provider 3: Straight line fallback ─────────────────────────────
-    // Last resort so the map always has *something* — better than an empty
-    // polyline. Distance is haversine; duration is a 30 km/h heuristic.
-    const distKm = haversineKm(
+    // Shared provider chain (Google → OSRM → straight line) lives in
+    // services/routing so the ride estimate/create fallbacks resolve the
+    // exact same road route this proxy serves to the maps.
+    const data = await getRoute(
       { lat: oLat, lng: oLng },
       { lat: dLat, lng: dLng },
     );
-    res.status(200).json({
-      success: true,
-      data: {
-        provider: 'straight',
-        polyline: [
-          { lat: oLat, lng: oLng },
-          { lat: dLat, lng: dLng },
-        ],
-        distanceMeters: Math.round(distKm * 1000),
-        durationSeconds: Math.round((distKm / 30) * 3600),
-      },
-    });
+    res.status(200).json({ success: true, data });
   } catch (error) {
     console.error('[geo] directions error:', error);
     res.status(500).json({ success: false, message: 'Directions failed' });

@@ -12,6 +12,7 @@ import {
   consumeRedemption,
 } from '../services/loyaltyEngine';
 import { safeResolveSurge, isPickupBlocked } from '../services/surge';
+import { getRouteEstimate } from '../services/routing';
 import { emitToUser, emitToRide, notifyNearbyDrivers } from '../socket';
 import { sendPushToUser } from './fcmController';
 import { getRedis } from '../config/redis';
@@ -838,18 +839,16 @@ export const estimateFare = async (req: Request, res: Response): Promise<void> =
       distance = overrideDistance;
       duration = overrideDuration;
     } else {
-      // Calculate distance (Haversine formula)
-      const R = 6371; // km
-      const dLat = ((dropoff.lat - pickup.lat) * Math.PI) / 180;
-      const dLng = ((dropoff.lng - pickup.lng) * Math.PI) / 180;
-      const a =
-        Math.sin(dLat / 2) ** 2 +
-        Math.cos((pickup.lat * Math.PI) / 180) *
-          Math.cos((dropoff.lat * Math.PI) / 180) *
-          Math.sin(dLng / 2) ** 2;
-      const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
-      distance = overrideDistance ?? R * c;
-      duration = overrideDuration ?? distance * 3; // rough fallback: 3 min/km
+      // No client-side routed values — resolve the road route server-side
+      // via the same Google → OSRM chain /geo/directions uses. Haversine
+      // (straight line + 30 km/h) survives only as getRouteEstimate's own
+      // last-resort provider when both routers are unreachable.
+      const routed = await getRouteEstimate(
+        { lat: pickup.lat, lng: pickup.lng },
+        { lat: dropoff.lat, lng: dropoff.lng },
+      );
+      distance = overrideDistance ?? routed.distanceKm;
+      duration = overrideDuration ?? routed.durationMin;
     }
 
     // Build the list of types to price. We union admin-managed active
@@ -968,12 +967,11 @@ export const createRide = async (req: AuthRequest, res: Response): Promise<void>
 
     // Distance/duration: prefer the real-route values the client already
     // resolved via /geo/directions (Google/OSRM road distance) so the
-    // persisted ride matches the quote the rider saw on SelectRide. Only fall
-    // back to straight-line Haversine when the client didn't send them (older
-    // app build, or directions failed). This mirrors `estimateFare` above —
-    // previously createRide ALWAYS recomputed Haversine and silently discarded
-    // the routed distance, so the booked fare/distance disagreed with the quote
-    // whenever Google/OSRM were reachable.
+    // persisted ride matches the quote the rider saw on SelectRide. When the
+    // client didn't send them (older app build, or directions failed) we
+    // resolve the road route server-side instead — mirrors `estimateFare`
+    // above, so the booked distance always matches the quote. Haversine
+    // survives only inside getRouteEstimate as its last-resort provider.
     const toNum = (v: unknown): number | null => {
       const n = typeof v === 'number' ? v : parseFloat(String(v));
       return Number.isFinite(n) && n > 0 ? n : null;
@@ -987,18 +985,12 @@ export const createRide = async (req: AuthRequest, res: Response): Promise<void>
       distance = overrideDistance;
       duration = overrideDuration;
     } else {
-      // Straight-line Haversine fallback (rough 3 min/km for duration).
-      const R = 6371;
-      const dLat = ((dropoff.lat - pickup.lat) * Math.PI) / 180;
-      const dLng = ((dropoff.lng - pickup.lng) * Math.PI) / 180;
-      const a =
-        Math.sin(dLat / 2) ** 2 +
-        Math.cos((pickup.lat * Math.PI) / 180) *
-          Math.cos((dropoff.lat * Math.PI) / 180) *
-          Math.sin(dLng / 2) ** 2;
-      const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
-      distance = overrideDistance ?? R * c;
-      duration = overrideDuration ?? distance * 3;
+      const routed = await getRouteEstimate(
+        { lat: pickup.lat, lng: pickup.lng },
+        { lat: dropoff.lat, lng: dropoff.lng },
+      );
+      distance = overrideDistance ?? routed.distanceKm;
+      duration = overrideDuration ?? routed.durationMin;
     }
 
     // Apply promo

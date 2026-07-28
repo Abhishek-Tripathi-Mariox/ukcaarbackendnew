@@ -320,12 +320,21 @@ router.post(
         res.status(400).json({ success: false, message: 'reason is required' });
         return;
       }
+      // Timed suspension: "duration (days)" used to be collected and thrown
+      // away, so every suspension was indefinite. Store the expiry; the OTP
+      // login path auto-lifts it once passed.
+      const days = Number(duration);
+      const suspendedUntil =
+        Number.isFinite(days) && days > 0
+          ? new Date(Date.now() + days * 24 * 60 * 60 * 1000)
+          : undefined;
       const driver = await User.findOneAndUpdate(
         { _id: req.params.id, role: 'driver' },
         {
           isActive: false,
           disabledAt: new Date(),
           disabledReason: reason,
+          ...(suspendedUntil ? { suspendedUntil } : { $unset: { suspendedUntil: 1 } }),
           'driverProfile.isOnline': false,
           // Revoke the session too — without this the suspended driver keeps
           // a working app session until their access token happens to expire.
@@ -361,7 +370,7 @@ router.post(
         { _id: req.params.id, role: 'driver' },
         {
           isActive: true,
-          $unset: { disabledAt: 1, disabledReason: 1 },
+          $unset: { disabledAt: 1, disabledReason: 1, suspendedUntil: 1 },
         },
         { new: true },
       );

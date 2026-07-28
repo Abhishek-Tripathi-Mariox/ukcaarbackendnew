@@ -24,6 +24,7 @@ export interface IPayment extends Document {
     | 'refund'
     | 'subscription'
     | 'cancellation_fee'
+    | 'adjustment'
     | 'incentive'
     | 'bonus';
   amount: number;
@@ -76,6 +77,7 @@ const paymentSchema = new Schema<IPayment>(
         'refund',
         'subscription',
         'cancellation_fee',
+        'adjustment',
         'incentive',
         'bonus',
       ],

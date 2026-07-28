@@ -101,26 +101,41 @@ router.get('/dashboard', async (_req: Request, res: Response) => {
       User.countDocuments({ role: 'customer' }),
       User.countDocuments({ role: 'driver' }),
       User.countDocuments({ role: 'driver', 'driverProfile.registrationStep': 'approved' }),
-      User.countDocuments({ role: 'driver', 'driverProfile.registrationStep': { $ne: 'approved' } }),
+      // 'pending' = submitted and awaiting review. $ne:'approved' counted every
+      // half-registered signup and every permanently rejected driver forever.
+      User.countDocuments({ role: 'driver', 'driverProfile.registrationStep': 'pending' }),
       Ride.countDocuments(),
-      Ride.countDocuments({ status: { $in: ['searching', 'driver_assigned', 'driver_arriving', 'driver_arrived', 'in_progress'] } }),
+      Ride.countDocuments({ status: { $in: ['searching', 'driver_assigned', 'driver_arriving', 'driver_arrived', 'in_progress', 'payment_pending'] } }),
       Ride.countDocuments({ status: 'completed' }),
       Ride.countDocuments({ status: 'cancelled' }),
       Ride.countDocuments({ createdAt: { $gte: today } }),
       Ride.countDocuments({ createdAt: { $gte: weekAgo } }),
+      // Revenue = CUSTOMER-side ride payments only. Ride completion writes two
+      // ride_payment rows (customer fare + driver earnings); summing both
+      // reported ~1.8x real gross revenue. The payer-role filter keeps exactly
+      // one row per ride (wallet rides get their customer row from the wallet
+      // debit endpoint).
       Payment.aggregate([
         { $match: { status: 'completed', type: 'ride_payment' } },
+        { $lookup: { from: 'users', localField: 'user', foreignField: '_id', as: 'payer' } },
+        { $match: { 'payer.role': 'customer' } },
         { $group: { _id: null, total: { $sum: '$amount' } } },
       ]),
       Payment.aggregate([
         { $match: { status: 'completed', type: 'ride_payment', createdAt: { $gte: today } } },
+        { $lookup: { from: 'users', localField: 'user', foreignField: '_id', as: 'payer' } },
+        { $match: { 'payer.role': 'customer' } },
         { $group: { _id: null, total: { $sum: '$amount' } } },
       ]),
       Payment.aggregate([
         { $match: { status: 'completed', type: 'ride_payment', createdAt: { $gte: weekAgo } } },
+        { $lookup: { from: 'users', localField: 'user', foreignField: '_id', as: 'payer' } },
+        { $match: { 'payer.role': 'customer' } },
         { $group: { _id: null, total: { $sum: '$amount' } } },
       ]),
-      User.countDocuments({ role: 'driver', 'driverProfile.isOnline': true }),
+      // Approved drivers only — an online-but-unapproved driver made the
+      // dashboard's offline slice (verified - online) go negative.
+      User.countDocuments({ role: 'driver', 'driverProfile.isOnline': true, 'driverProfile.registrationStep': 'approved' }),
       User.countDocuments({ role: 'driver', 'driverProfile.isOnePass': true }),
       PromoCode.countDocuments({ isActive: true, expiresAt: { $gt: new Date() } }),
       Wallet.aggregate([{ $group: { _id: null, total: { $sum: '$balance' } } }]),
@@ -151,7 +166,9 @@ router.get('/dashboard', async (_req: Request, res: Response) => {
           cancelled: cancelledRides,
           today: todayRides,
           thisWeek: weekRides,
-          completionRate: totalRides > 0 ? ((completedRides / totalRides) * 100).toFixed(1) : 0,
+          // Of FINISHED rides (completed + cancelled) — including still-active
+          // rides in the denominator permanently understated the rate.
+          completionRate: (completedRides + cancelledRides) > 0 ? ((completedRides / (completedRides + cancelledRides)) * 100).toFixed(1) : 0,
         },
         revenue: {
           total: totalRevenue[0]?.total || 0,
@@ -229,6 +246,9 @@ router.get('/analytics/revenue', async (req: Request, res: Response) => {
 
     const revenueByDay = await Payment.aggregate([
       { $match: { status: 'completed', type: 'ride_payment', createdAt: { $gte: start, $lte: end } } },
+      // Customer-side rows only — see the dashboard revenue comment.
+      { $lookup: { from: 'users', localField: 'user', foreignField: '_id', as: 'payer' } },
+      { $match: { 'payer.role': 'customer' } },
       {
         $group: {
           _id: { $dateToString: { format: '%Y-%m-%d', date: '$createdAt' } },
@@ -241,6 +261,8 @@ router.get('/analytics/revenue', async (req: Request, res: Response) => {
 
     const revenueByMethod = await Payment.aggregate([
       { $match: { status: 'completed', type: 'ride_payment', createdAt: { $gte: start, $lte: end } } },
+      { $lookup: { from: 'users', localField: 'user', foreignField: '_id', as: 'payer' } },
+      { $match: { 'payer.role': 'customer' } },
       { $group: { _id: '$method', total: { $sum: '$amount' }, count: { $sum: 1 } } },
     ]);
 
@@ -282,11 +304,13 @@ router.get('/users', async (req: Request, res: Response) => {
     if (isActive !== undefined) filter.isActive = isActive === 'true';
     if (isVerified !== undefined) filter.isVerified = isVerified === 'true';
     if (search) {
+      const safe = escapeRegex(search);
+      const digits = searchDigits(search);
       filter.$or = [
-        { firstName: { $regex: search, $options: 'i' } },
-        { lastName: { $regex: search, $options: 'i' } },
-        { email: { $regex: search, $options: 'i' } },
-        { phone: { $regex: search, $options: 'i' } },
+        { firstName: { $regex: safe, $options: 'i' } },
+        { lastName: { $regex: safe, $options: 'i' } },
+        { email: { $regex: safe, $options: 'i' } },
+        { phone: { $regex: digits || safe, $options: 'i' } },
       ];
     }
 
@@ -385,7 +409,9 @@ router.get('/users/:id', async (req: Request, res: Response) => {
             completedRides: { $sum: { $cond: [{ $eq: ['$status', 'completed'] }, 1, 0] } },
             cancelledRides: { $sum: { $cond: [{ $eq: ['$status', 'cancelled'] }, 1, 0] } },
             totalSpent: { $sum: { $cond: [{ $eq: ['$status', 'completed'] }, { $ifNull: ['$actualFare', 0] }, 0] } },
-            totalDistanceKm: { $sum: { $cond: [{ $eq: ['$status', 'completed'] }, { $ifNull: ['$distance', 0] }, 0] } },
+            // Ride schema has actualDistance/estimatedDistance — '$distance'
+            // never existed, so this KPI always read 0.0 km.
+            totalDistanceKm: { $sum: { $cond: [{ $eq: ['$status', 'completed'] }, { $ifNull: ['$actualDistance', { $ifNull: ['$estimatedDistance', 0] }] }, 0] } },
             avgFare: { $avg: { $cond: [{ $eq: ['$status', 'completed'] }, '$actualFare', null] } },
           },
         },
@@ -828,11 +854,13 @@ router.get('/drivers', async (req: Request, res: Response) => {
       filter['driverProfile.serviceType'] = serviceType;
     }
     if (search) {
+      const safe = escapeRegex(search);
+      const digits = searchDigits(search);
       filter.$or = [
-        { firstName: { $regex: search, $options: 'i' } },
-        { lastName: { $regex: search, $options: 'i' } },
-        { phone: { $regex: search, $options: 'i' } },
-        { 'driverProfile.plateNumber': { $regex: search, $options: 'i' } },
+        { firstName: { $regex: safe, $options: 'i' } },
+        { lastName: { $regex: safe, $options: 'i' } },
+        { phone: { $regex: digits || safe, $options: 'i' } },
+        { 'driverProfile.plateNumber': { $regex: safe, $options: 'i' } },
       ];
     }
 
@@ -875,12 +903,29 @@ router.get('/drivers/applications', async (req: Request, res: Response) => {
     const page = parseInt(req.query.page as string) || 1;
     const limit = parseInt(req.query.limit as string) || 20;
     const status = req.query.status as string;
+    const search = req.query.search as string | undefined;
 
     const filter: Record<string, any> = { role: 'driver' };
     if (status === 'pending') {
-      filter['driverProfile.registrationStep'] = { $ne: 'approved' };
+      // Submitted-and-waiting only. $ne:'approved' also matched half-registered
+      // signups and permanently rejected drivers, so the review queue never
+      // drained and rejected drivers looked identical to unreviewed ones.
+      filter['driverProfile.registrationStep'] = 'pending';
+    } else if (status === 'rejected') {
+      filter['driverProfile.registrationStep'] = 'rejected';
     } else if (status === 'verified') {
       filter['driverProfile.registrationStep'] = 'approved';
+    }
+    // The Applications tab search box used to be silently ignored.
+    if (search) {
+      const safe = escapeRegex(search);
+      const digits = searchDigits(search);
+      filter.$or = [
+        { firstName: { $regex: safe, $options: 'i' } },
+        { lastName: { $regex: safe, $options: 'i' } },
+        { phone: { $regex: digits || safe, $options: 'i' } },
+        { 'driverProfile.plateNumber': { $regex: safe, $options: 'i' } },
+      ];
     }
 
     const drivers = await User.find(filter)
@@ -1553,12 +1598,30 @@ const SCHEDULED_BOOKING_POPULATE = {
  *   scheduled → isScheduled === true
  * Any other value is treated as an exact vehicle-code match.
  */
+/** Escape user input before embedding it in a $regex — "+91…" used to throw
+ * an invalid-regex error that surfaced as a 500/empty table. */
+function escapeRegex(input: unknown): string {
+  return String(input ?? '').trim().replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+/** Phone-looking search input reduced to digits so "+91 98…" matches a stored
+ * "9198…". Empty when the input has fewer than 3 digits. */
+function searchDigits(input: unknown): string {
+  const d = String(input ?? '').replace(/\D/g, '');
+  return d.length >= 3 ? d : '';
+}
+
 function applyRideTypeCategory(filter: Record<string, any>, rideType?: string) {
   if (!rideType) return;
   if (rideType === 'scheduled') {
     filter.isScheduled = true;
+  } else if (rideType === 'private') {
+    // Privateness is the isPrivate flag — rideType stores the vehicle
+    // catalogue code, never the literal 'private' (exact-matching it returned
+    // zero rows forever).
+    filter.isPrivate = true;
+    filter.isScheduled = { $ne: true };
   } else if (rideType === 'instant') {
-    filter.rideType = { $ne: 'private' };
+    filter.isPrivate = { $ne: true };
     filter.isScheduled = { $ne: true };
   } else {
     filter.rideType = rideType;
@@ -1575,11 +1638,13 @@ function applyRideTypeCategory(filter: Record<string, any>, rideType?: string) {
 async function buildRideSearchOr(term: string): Promise<Record<string, any>[]> {
   const t = term.trim();
   if (!t) return [];
+  const safeT = escapeRegex(t);
+  const digitsT = searchDigits(t);
   const userMatch = await User.find({
     $or: [
-      { firstName: { $regex: t, $options: 'i' } },
-      { lastName: { $regex: t, $options: 'i' } },
-      { phone: { $regex: t, $options: 'i' } },
+      { firstName: { $regex: safeT, $options: 'i' } },
+      { lastName: { $regex: safeT, $options: 'i' } },
+      { phone: { $regex: digitsT || safeT, $options: 'i' } },
     ],
   })
     .select('_id')
@@ -1619,9 +1684,11 @@ router.get('/rides', async (req: Request, res: Response) => {
       if (endDate) filter.createdAt.$lte = new Date(endDate as string);
     }
     if (minFare || maxFare) {
-      filter.estimatedFare = {};
-      if (minFare) filter.estimatedFare.$gte = parseFloat(minFare as string);
-      if (maxFare) filter.estimatedFare.$lte = parseFloat(maxFare as string);
+      // Match on what the table shows: actualFare when set, else estimatedFare.
+      const lo = minFare ? parseFloat(minFare as string) : -Infinity;
+      const hi = maxFare ? parseFloat(maxFare as string) : Infinity;
+      const shown = { $ifNull: ['$actualFare', { $ifNull: ['$estimatedFare', 0] }] };
+      filter.$expr = { $and: [{ $gte: [shown, lo] }, { $lte: [shown, hi] }] };
     }
     // Free-text search over ride id / customer / driver. Resolved to a set
     // of customer + driver ids so the matched users' rides surface too.
@@ -1648,11 +1715,15 @@ router.get('/rides', async (req: Request, res: Response) => {
     // we also pull bookings here and shape them like Ride rows. Excluded
     // when the caller is filtering on instant-only attributes (driver,
     // paymentMethod, rideType) since none of those apply to a booking.
+    // 'reserved' is a booking-only status: show bookings and no rides.
+    // 'searching' is a ride-only status: show rides and no bookings (bookings
+    // used to leak into the Searching filter badged "Reserved").
+    if (status === 'reserved') filter.status = '__no_ride_matches__';
     const includeScheduled =
       !driverId &&
       !paymentMethod &&
       (!rideType || rideType === 'scheduled') &&
-      (!status || status === 'searching' || status === 'cancelled');
+      (!status || status === 'reserved' || status === 'cancelled');
 
     // Booking-side filter mirrors the ride filter where it makes sense.
     const bookingFilter: Record<string, any> = {};
@@ -1886,18 +1957,26 @@ router.get('/rides/disputed', async (req: Request, res: Response) => {
   try {
     const page = parseInt(req.query.page as string) || 1;
     const limit = parseInt(req.query.limit as string) || 50;
+    const { status, search } = req.query;
 
-    const filter = {
-      // Already-resolved disputes drop out of the queue.
-      'dispute.resolved': { $ne: true },
-      $or: [
-        { 'rating.customerToDriver': { $lte: 2 } },
-        { 'rating.driverToCustomer': { $lte: 2 } },
-        { status: 'cancelled', 'cancellation.fee': { $gt: 0 } },
-      ],
-    };
+    const flaggedOr = [
+      { 'rating.customerToDriver': { $lte: 2 } },
+      { 'rating.driverToCustomer': { $lte: 2 } },
+      { status: 'cancelled', 'cancellation.fee': { $gt: 0 } },
+    ];
+    const filter: Record<string, any> = { $or: flaggedOr };
+    // Open (default) vs resolved — the UI's status dropdown used to be
+    // ignored, and "resolved" could never match because the queue always
+    // excluded resolved disputes.
+    if (status === 'resolved') filter['dispute.resolved'] = true;
+    else filter['dispute.resolved'] = { $ne: true };
+    if (search) {
+      const searchOr = await buildRideSearchOr(String(search));
+      if (searchOr.length) filter.$and = [{ $or: searchOr }];
+      else filter._id = null; // no match -> empty, not everything
+    }
 
-    const [rides, total] = await Promise.all([
+    const [ridesRaw, total] = await Promise.all([
       Ride.find(filter)
         .populate('customer', 'firstName lastName phone')
         .populate('driver', 'firstName lastName phone')
@@ -1906,6 +1985,27 @@ router.get('/rides/disputed', async (req: Request, res: Response) => {
         .limit(limit),
       Ride.countDocuments(filter),
     ]);
+
+    // Annotate rows with the dispute.status/reason the admin UI renders.
+    // Mongoose materialises an empty dispute subdoc on EVERY ride, so the
+    // frontend could not tell flagged rides apart; the reason is derived from
+    // why the ride is in this queue.
+    const rides = ridesRaw.map((r: any) => {
+      const o = r.toObject();
+      const reasons: string[] = [];
+      if (o.rating?.customerToDriver != null && o.rating.customerToDriver <= 2)
+        reasons.push('Customer rated driver ' + o.rating.customerToDriver + ' star(s)');
+      if (o.rating?.driverToCustomer != null && o.rating.driverToCustomer <= 2)
+        reasons.push('Driver rated customer ' + o.rating.driverToCustomer + ' star(s)');
+      if (o.status === 'cancelled' && (o.cancellation?.fee ?? 0) > 0)
+        reasons.push('Cancelled with a \u20b9' + o.cancellation.fee + ' fee');
+      o.dispute = {
+        ...(o.dispute ?? {}),
+        status: o.dispute?.resolved ? 'resolved' : 'open',
+        reason: o.dispute?.reason || reasons.join('; ') || 'Flagged for review',
+      };
+      return o;
+    });
 
     res.status(200).json({
       success: true,
@@ -1948,7 +2048,7 @@ router.get('/rides/:id', async (req: Request, res: Response) => {
  */
 router.put('/rides/:id/cancel', requirePermission(PERMISSIONS.MANAGE_RIDES), auditLog({ action: 'ride.cancel', resourceType: 'Ride' }), async (req: Request, res: Response) => {
   try {
-    const { reason, refund, refundAmount } = req.body;
+    const { reason, refund, refundAmount, refundPercentage } = req.body;
 
     const ride = await Ride.findById(req.params.id);
     if (!ride) {
@@ -1998,9 +2098,16 @@ router.put('/rides/:id/cancel', requirePermission(PERMISSIONS.MANAGE_RIDES), aud
     // second admin, each crediting the wallet once more.
     if (refund && ride.paymentStatus === 'completed') {
       // Cap at what was actually paid — an arbitrary refundAmount from the
-      // request body could exceed the fare.
+      // request body could exceed the fare. Priority: explicit percentage
+      // (what the admin UI collects) → explicit amount → full fare. The old
+      // code ignored the percentage entirely, so "refund 10%" refunded 100%.
       const paidAmt = Number(ride.actualFare || ride.estimatedFare || 0);
-      const amount = Math.min(Math.max(0, Number(refundAmount) || paidAmt), paidAmt);
+      const pct = Number(refundPercentage);
+      const requested =
+        Number.isFinite(pct) && pct > 0 && pct <= 100
+          ? Math.round(paidAmt * pct) / 100
+          : Number(refundAmount) || paidAmt;
+      const amount = Math.min(Math.max(0, requested), paidAmt);
 
       if (amount > 0) {
         await Payment.create({
@@ -2115,6 +2222,10 @@ router.put('/rides/scheduled/:bookingId/cancel', requirePermission(PERMISSIONS.M
 router.put('/rides/:id/reassign', requirePermission(PERMISSIONS.MANAGE_RIDES), auditLog({ action: 'ride.reassign', resourceType: 'Ride' }), async (req: Request, res: Response) => {
   try {
     const { driverId, reason } = req.body;
+    if (!mongoose.isValidObjectId(driverId)) {
+      res.status(400).json({ success: false, message: 'Invalid driver id - paste the full 24-character driver ID.' });
+      return;
+    }
 
     const [ride, newDriver] = await Promise.all([
       Ride.findById(req.params.id),
@@ -2912,7 +3023,11 @@ router.post('/promos', requirePermission(PERMISSIONS.MANAGE_PROMOS), auditLog({ 
       value: Number(value) || 0,
       maxUses: Number(maxUses) || 100,
       minFare: Number(minFare ?? minRideAmount) || 0,
-      maxDiscount: Number(maxDiscount) || 50,
+      // Absent/0 means "no cap" — do NOT default to 50 (that silently halved
+      // every promo above Rs.50).
+      ...(Number(maxDiscount) > 0 && { maxDiscount: Number(maxDiscount) }),
+      ...(description && { description: String(description).trim() }),
+      ...(Number(req.body.maxUsesPerUser) > 0 && { maxUsesPerUser: Number(req.body.maxUsesPerUser) }),
       expiresAt: expiresAt ? new Date(expiresAt) : defaultExpiry,
       description: description || '',
       isActive: true,
@@ -3000,7 +3115,7 @@ router.get('/payments', async (req: Request, res: Response) => {
   try {
     const page = parseInt(req.query.page as string) || 1;
     const limit = parseInt(req.query.limit as string) || 50;
-    const { type, status, method, userId, startDate, endDate } = req.query;
+    const { type, status, method, userId, startDate, endDate, search } = req.query;
 
     const filter: Record<string, any> = {};
     if (type) filter.type = type;
@@ -3012,10 +3127,34 @@ router.get('/payments', async (req: Request, res: Response) => {
       if (startDate) filter.createdAt.$gte = new Date(startDate as string);
       if (endDate) filter.createdAt.$lte = new Date(endDate as string);
     }
+    // Search — the box existed in the UI but the param was ignored, so typing
+    // just returned the identical unfiltered list. Matches payment id (exact),
+    // Razorpay ids, or the paying user (name/phone).
+    if (search) {
+      const term = String(search).trim();
+      const or: Record<string, any>[] = [];
+      if (mongoose.isValidObjectId(term)) or.push({ _id: term });
+      const safe = escapeRegex(term);
+      or.push({ razorpayOrderId: { $regex: safe, $options: 'i' } });
+      or.push({ razorpayPaymentId: { $regex: safe, $options: 'i' } });
+      const digits = searchDigits(term);
+      const userMatch = await User.find({
+        $or: [
+          { firstName: { $regex: safe, $options: 'i' } },
+          { lastName: { $regex: safe, $options: 'i' } },
+          { phone: { $regex: digits || safe, $options: 'i' } },
+        ],
+      })
+        .select('_id')
+        .limit(200)
+        .lean();
+      if (userMatch.length) or.push({ user: { $in: userMatch.map((u: any) => u._id) } });
+      filter.$or = or;
+    }
 
     const [payments, total] = await Promise.all([
       Payment.find(filter)
-        .populate('user', 'firstName lastName phone role')
+        .populate('user', 'firstName lastName phone email role')
         .populate('ride', 'pickup.address dropoff.address actualFare')
         .sort({ createdAt: -1 })
         .skip((page - 1) * limit)
@@ -3355,14 +3494,24 @@ router.put('/wallets/:userId/adjust', requirePermission(PERMISSIONS.ADJUST_WALLE
     }
 
     const adjustment = type === 'debit' ? -Math.abs(amount) : Math.abs(amount);
-    const newBalance = Math.max(0, wallet.balance + adjustment);
+    // Reject over-debits instead of silently clamping: the old Math.max(0,...)
+    // reported success while removing less than the admin asked for.
+    if (type === 'debit' && wallet.balance + adjustment < 0) {
+      res.status(400).json({
+        success: false,
+        message: `Insufficient balance: wallet holds only ₹${wallet.balance.toFixed(2)}.`,
+      });
+      return;
+    }
+    const newBalance = wallet.balance + adjustment;
     wallet.balance = newBalance;
     await wallet.save();
 
-    // Log the adjustment as a payment record
+    // Log the adjustment as a payment record ('adjustment', not a fake
+    // cancellation fee, so statements read honestly)
     await Payment.create({
       user: req.params.userId,
-      type: type === 'debit' ? 'cancellation_fee' : 'wallet_topup',
+      type: 'adjustment',
       amount: Math.abs(amount),
       method: 'wallet',
       status: 'completed',
@@ -3743,7 +3892,9 @@ router.post('/broadcast', requirePermission(PERMISSIONS.SEND_NOTIFICATIONS), aud
       return;
     }
 
-    const filter: Record<string, any> = { isActive: true };
+    // 'all' means customers + drivers; admin accounts should not receive
+    // marketing/ops broadcasts.
+    const filter: Record<string, any> = { isActive: true, role: { $in: ['customer', 'driver'] } };
     if (targetRole) filter.role = targetRole;
     if (targetUserIds?.length) filter._id = { $in: targetUserIds };
 

@@ -39,10 +39,12 @@ router.get(
       if (req.query.tag) filter.tags = req.query.tag;
       if (req.query.q) {
         const q = String(req.query.q).trim();
+        // Escape before $regex — "+"/"(" in a search used to 500 the list.
+        const safeQ = q.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
         if (q.startsWith('TKT-')) filter.ticketNumber = q;
         else filter.$or = [
-          { subject: { $regex: q, $options: 'i' } },
-          { ticketNumber: { $regex: q, $options: 'i' } },
+          { subject: { $regex: safeQ, $options: 'i' } },
+          { ticketNumber: { $regex: safeQ, $options: 'i' } },
         ];
       }
       if (req.query.startDate || req.query.endDate) {
@@ -51,19 +53,35 @@ router.get(
         if (req.query.endDate) filter.createdAt.$lte = new Date(req.query.endDate as string);
       }
 
-      const [items, total, summary] = await Promise.all([
-        SupportTicket.find(filter)
+      // priority is a string enum — a plain descending sort ordered it
+      // lexicographically (urgent > normal > low > HIGH), burying high-priority
+      // tickets below low. Rank it explicitly, page on the ranked ids, then
+      // hydrate with populate in that order.
+      const rankedIds = await SupportTicket.aggregate([
+        { $match: filter },
+        {
+          $addFields: {
+            priorityRank: { $indexOfArray: [['low', 'normal', 'high', 'urgent'], '$priority'] },
+          },
+        },
+        { $sort: { priorityRank: -1, createdAt: -1 } },
+        { $skip: (page - 1) * limit },
+        { $limit: limit },
+        { $project: { _id: 1 } },
+      ]);
+      const idOrder = rankedIds.map((r: any) => String(r._id));
+      const [itemsUnordered, total, summary] = await Promise.all([
+        SupportTicket.find({ _id: { $in: idOrder } })
           .select('-messages')
           .populate('submittedBy', 'firstName lastName email phone role')
-          .populate('assignedTo', 'firstName lastName email')
-          .sort({ priority: -1, createdAt: -1 })
-          .skip((page - 1) * limit)
-          .limit(limit),
+          .populate('assignedTo', 'firstName lastName email'),
         SupportTicket.countDocuments(filter),
         SupportTicket.aggregate([
           { $group: { _id: '$status', count: { $sum: 1 } } },
         ]),
       ]);
+      const byId = new Map(itemsUnordered.map((t: any) => [String(t._id), t]));
+      const items = idOrder.map((id) => byId.get(id)).filter(Boolean);
 
       const statusCounts: Record<string, number> = {};
       summary.forEach((row) => {

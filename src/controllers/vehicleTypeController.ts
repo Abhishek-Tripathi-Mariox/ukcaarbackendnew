@@ -277,17 +277,27 @@ export const adminUpdateVehicleType = async (
       baseFare, perKmFare, perMinFare, minFare,
     } = req.body ?? {};
     if (name !== undefined) updates.name = String(name).trim();
+    // null = "clear this field" (fall back to the default), matching the UI
+    // copy. Omitted keys keep their value; undefined never reaches here.
+    const unset: Record<string, 1> = {};
+    const setOrUnset = (key: string, raw: unknown, coerce: (v: any) => any) => {
+      if (raw === undefined) return;
+      if (raw === null || raw === '') unset[key] = 1;
+      else updates[key] = coerce(raw);
+    };
     if (code !== undefined) updates.code = String(code).toLowerCase().trim();
-    if (description !== undefined) updates.description = description;
+    setOrUnset('description', description, (v) => String(v));
     if (sortOrder !== undefined) updates.sortOrder = sortOrder;
     if (isActive !== undefined) updates.isActive = !!isActive;
     if (tier !== undefined) updates.tier = tier === 'private' ? 'private' : 'instant';
-    if (baseFare !== undefined) updates.baseFare = num(baseFare);
-    if (perKmFare !== undefined) updates.perKmFare = num(perKmFare);
-    if (perMinFare !== undefined) updates.perMinFare = num(perMinFare);
-    if (minFare !== undefined) updates.minFare = num(minFare);
+    setOrUnset('baseFare', baseFare, num);
+    setOrUnset('perKmFare', perKmFare, num);
+    setOrUnset('perMinFare', perMinFare, num);
+    setOrUnset('minFare', minFare, num);
 
-    const updated = await VehicleType.findByIdAndUpdate(id, updates, { new: true });
+    const updateDoc: Record<string, any> = { $set: updates };
+    if (Object.keys(unset).length) updateDoc.$unset = unset;
+    const updated = await VehicleType.findByIdAndUpdate(id, updateDoc, { new: true });
     if (!updated) {
       res.status(404).json({ success: false, message: 'Vehicle type not found' });
       return;

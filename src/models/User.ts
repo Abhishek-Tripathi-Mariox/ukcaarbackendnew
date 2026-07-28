@@ -21,6 +21,8 @@ export interface IUser extends Document {
   lastLoginAt?: Date;
   lastLoginIp?: string;
   disabledAt?: Date;
+  /** Timed suspensions auto-lift when this passes (checked at OTP login). */
+  suspendedUntil?: Date;
   disabledReason?: string;
   isVerified: boolean;
   isActive: boolean;
@@ -203,6 +205,7 @@ const userSchema = new Schema<IUser>(
     lastLoginAt: { type: Date },
     lastLoginIp: { type: String },
     disabledAt: { type: Date },
+    suspendedUntil: { type: Date },
     disabledReason: { type: String },
     isVerified: { type: Boolean, default: false },
     isActive: { type: Boolean, default: true },

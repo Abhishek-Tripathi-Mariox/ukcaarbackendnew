@@ -32,7 +32,12 @@ router.get(
       const limit = Math.min(parseInt(req.query.limit as string) || 50, 200);
       const filter: any = {};
       if (req.query.status) filter.status = req.query.status;
-      if (req.query.utr) filter.utr = req.query.utr;
+      if (req.query.utr) {
+        // Substring match (escaped) — exact-only match made partial UTRs read
+        // as "no settlements found" while the admin was still typing.
+        const safeUtr = String(req.query.utr).trim().replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        filter.utr = { $regex: safeUtr, $options: 'i' };
+      }
       if (req.query.razorpayPaymentId) filter.razorpayPaymentId = req.query.razorpayPaymentId;
       if (req.query.startDate || req.query.endDate) {
         filter.createdAt = {};
@@ -397,9 +402,20 @@ router.post(
         res.status(404).json({ success: false, message: 'Ride not found' });
         return;
       }
-      const fareAmount = ride.actualFare ?? ride.estimatedFare ?? 100;
+      // A GST invoice must reflect money actually collected. The old code fell
+      // back to estimatedFare and then a fabricated ₹100, and never checked the
+      // ride was completed/paid — one click could issue a sequentially numbered
+      // invoice for a cancelled ride and money never received.
+      if (ride.status !== 'completed' || ride.paymentStatus !== 'completed') {
+        res.status(400).json({
+          success: false,
+          message: 'Invoices can only be generated for completed, paid rides.',
+        });
+        return;
+      }
+      const fareAmount = Number(ride.actualFare) || 0;
       if (fareAmount <= 0) {
-        res.status(400).json({ success: false, message: 'Ride has no fare amount' });
+        res.status(400).json({ success: false, message: 'Ride has no collected fare amount' });
         return;
       }
 

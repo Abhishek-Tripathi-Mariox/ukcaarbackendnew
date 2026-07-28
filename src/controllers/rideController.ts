@@ -997,12 +997,27 @@ export const createRide = async (req: AuthRequest, res: Response): Promise<void>
         $expr: { $lt: ['$usedCount', '$maxUses'] },
       });
       if (promo) {
+        // Per-customer limit (maxUsesPerUser): count this customer's prior
+        // rides that redeemed the code. Unset = unlimited.
+        let userAllowed = true;
+        if (promo.maxUsesPerUser && promo.maxUsesPerUser > 0) {
+          const priorUses = await Ride.countDocuments({
+            customer: req.user!._id,
+            promoCode: promo.code,
+            status: { $nin: ['cancelled'] },
+          });
+          userAllowed = priorUses < promo.maxUsesPerUser;
+        }
         const fare = await calculateFare(rideType, distance, duration);
-        if (fare.total >= promo.minFare) {
+        if (userAllowed && fare.total >= promo.minFare) {
+          // maxDiscount is a CAP only when set; absent means no cap. (It used
+          // to default to 50, silently halving any larger promo.)
+          const cap =
+            promo.maxDiscount && promo.maxDiscount > 0 ? promo.maxDiscount : Infinity;
           promoDiscount =
             promo.type === 'percentage'
-              ? Math.min((fare.total * promo.value) / 100, promo.maxDiscount)
-              : Math.min(promo.value, promo.maxDiscount);
+              ? Math.min((fare.total * Math.max(0, promo.value)) / 100, cap)
+              : Math.min(Math.max(0, promo.value), cap);
           await PromoCode.findByIdAndUpdate(promo._id, { $inc: { usedCount: 1 } });
         }
       }

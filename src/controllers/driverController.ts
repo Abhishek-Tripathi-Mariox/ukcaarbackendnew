@@ -534,8 +534,14 @@ export const getMyDashboard = async (req: AuthRequest, res: Response): Promise<v
 export const getMyEarnings = async (req: AuthRequest, res: Response): Promise<void> => {
   try {
     const driverId = new mongoose.Types.ObjectId(req.user!._id);
-    const user = await User.findById(driverId).select('driverProfile.commissionRate');
+    const user = await User.findById(driverId).select(
+      'driverProfile.commissionRate driverProfile.rating',
+    );
     const commissionPct = user?.driverProfile?.commissionRate ?? 20;
+    // Raw rating (0 for a driver nobody has rated yet). The app applies the
+    // display rule — show 5 until a real rating exists — so the Earnings
+    // header stops rendering an em dash.
+    const driverRating = user?.driverProfile?.rating ?? 0;
 
     const now = new Date();
     const startOfThisMonth = new Date(now.getFullYear(), now.getMonth(), 1);
@@ -716,6 +722,7 @@ export const getMyEarnings = async (req: AuthRequest, res: Response): Promise<vo
         trend,
         hourlySeries, // Daily tab — today in 4-hour buckets
         weekSeries, // Weekly tab — last 7 days
+        rating: driverRating, // Earnings header stat (app shows 5 until rated)
 
         breakdown: {
           // totalEarned is GROSS (what riders paid) so Gross − Fee = Net

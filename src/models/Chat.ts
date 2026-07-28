@@ -48,6 +48,8 @@ export interface IPromoCode extends Document {
   maxDiscount: number;
   expiresAt: Date;
   isActive: boolean;
+  description?: string;
+  maxUsesPerUser?: number;
   createdAt: Date;
 }
 
@@ -55,11 +57,16 @@ const promoCodeSchema = new Schema<IPromoCode>(
   {
     code: { type: String, required: true, unique: true, uppercase: true },
     type: { type: String, enum: ['percentage', 'fixed'], required: true },
-    value: { type: Number, required: true },
+    value: { type: Number, required: true, min: 0 },
+    description: { type: String, trim: true },
     maxUses: { type: Number, default: 100 },
+    /** Per-customer redemption limit. Unset = unlimited. */
+    maxUsesPerUser: { type: Number, min: 1 },
     usedCount: { type: Number, default: 0 },
     minFare: { type: Number, default: 0 },
-    maxDiscount: { type: Number, default: 50 },
+    // No default: an absent maxDiscount means NO CAP. The old default of 50
+    // silently capped every promo (a "Rs.100 off" fixed promo paid out Rs.50).
+    maxDiscount: { type: Number, min: 0 },
     expiresAt: { type: Date, required: true },
     isActive: { type: Boolean, default: true },
   },

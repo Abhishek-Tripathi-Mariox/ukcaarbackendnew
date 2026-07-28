@@ -271,7 +271,14 @@ router.get(
       if (req.query.startDate || req.query.endDate) {
         const range: Record<string, Date> = {};
         if (req.query.startDate) range.$gte = new Date(req.query.startDate as string);
-        if (req.query.endDate) range.$lte = new Date(req.query.endDate as string);
+        if (req.query.endDate) {
+          // Date-only input means "through the END of that day" — $lte at
+          // midnight silently excluded the entire selected end date.
+          const raw = String(req.query.endDate);
+          const d = new Date(raw);
+          if (/^\d{4}-\d{2}-\d{2}$/.test(raw)) d.setHours(23, 59, 59, 999);
+          range.$lte = d;
+        }
         filter.createdAt = range;
       }
 

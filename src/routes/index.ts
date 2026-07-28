@@ -18,6 +18,48 @@ import appSettingsRoutes from './appSettings';
 
 const router = Router();
 
+// ── Maintenance mode enforcement ──
+// The admin Settings toggle promised "disable app access for users during
+// maintenance" but nothing ever checked the flag. Blocks app traffic with 503
+// while exempting: auth (so admins can log in), /admin (the panel itself),
+// /settings (apps poll it to show their own maintenance notice) and /health.
+// The flag is re-read at most every 30s so toggling applies quickly without a
+// DB hit per request.
+let maintCache = { value: false, at: 0 };
+router.use(async (req, res, next) => {
+  const path = req.path;
+  if (
+    path.startsWith('/auth') ||
+    path.startsWith('/admin') ||
+    path.startsWith('/settings') ||
+    path.startsWith('/health')
+  ) {
+    return next();
+  }
+  try {
+    if (Date.now() - maintCache.at > 30_000) {
+      const { Settings } = await import('../models');
+      const doc: any = await Settings.findOne({ key: 'platform' })
+        .select('maintenanceMode')
+        .lean();
+      maintCache = { value: !!doc?.maintenanceMode, at: Date.now() };
+    }
+  } catch {
+    // On a settings read failure, fail OPEN — never lock the whole API out
+    // because of a transient DB hiccup.
+    maintCache = { value: false, at: Date.now() };
+  }
+  if (maintCache.value) {
+    res.status(503).json({
+      success: false,
+      maintenance: true,
+      message: 'UKCAAR is temporarily down for maintenance. Please try again shortly.',
+    });
+    return;
+  }
+  next();
+});
+
 router.use('/auth', authRoutes);
 router.use('/rides', rideRoutes);
 router.use('/payments', paymentRoutes);

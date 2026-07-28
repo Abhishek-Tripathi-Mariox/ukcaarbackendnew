@@ -325,8 +325,9 @@ router.get(
         },
       ]),
       LoyaltyAccount.aggregate([
-        { $match: { tier: { $ne: null } } },
-        { $group: { _id: '$tierKey', count: { $sum: 1 } } },
+        // Include untiered accounts as a 'none' bucket so the tier rows sum to
+        // the total instead of looking like missing data.
+        { $group: { _id: { $ifNull: ['$tierKey', 'none'] }, count: { $sum: 1 } } },
       ]),
       LoyaltyRedemption.aggregate([
         { $group: { _id: '$status', count: { $sum: 1 } } },

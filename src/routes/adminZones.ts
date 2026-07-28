@@ -187,7 +187,15 @@ router.patch(
   auditLog({ action: 'surge_rule.update', resourceType: 'surge_rule' }),
   async (req: Request, res: Response) => {
     try {
-      const rule = await SurgeRule.findByIdAndUpdate(req.params.id, req.body, {
+      // zone:null means "make it Global" — findByIdAndUpdate(body) alone can
+      // never remove the field, so a zone-scoped rule was stuck that way.
+      const body: Record<string, any> = { ...req.body };
+      const update: Record<string, any> = { $set: body };
+      if (body.zone === null || body.zone === '') {
+        delete body.zone;
+        update.$unset = { zone: 1 };
+      }
+      const rule = await SurgeRule.findByIdAndUpdate(req.params.id, update, {
         new: true,
         runValidators: true,
       });

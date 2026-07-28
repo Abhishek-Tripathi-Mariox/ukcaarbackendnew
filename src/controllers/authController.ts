@@ -67,11 +67,19 @@ export const sendOtp = async (req: Request, res: Response): Promise<void> => {
     // this check the OTP LOGIN itself succeeded and the app landed a
     // suspended user on Home with a dead token.
     if (user && !user.isActive) {
-      res.status(403).json({
-        success: false,
-        message: 'Your account has been suspended. Please contact support.',
-      });
-      return;
+      // Timed suspensions lift themselves once the window passes.
+      if (user.suspendedUntil && user.suspendedUntil <= new Date()) {
+        user.isActive = true;
+        user.suspendedUntil = undefined;
+        (user as any).disabledAt = undefined;
+        (user as any).disabledReason = undefined;
+      } else {
+        res.status(403).json({
+          success: false,
+          message: 'Your account has been suspended. Please contact support.',
+        });
+        return;
+      }
     }
 
     if (!user) {
@@ -140,11 +148,18 @@ export const verifyOtp = async (req: Request, res: Response): Promise<void> => {
     // Suspended accounts: refuse token issuance (see sendOtp). Checked here
     // too because verify-otp is public and an OTP may pre-date the suspension.
     if (!user.isActive) {
-      res.status(403).json({
-        success: false,
-        message: 'Your account has been suspended. Please contact support.',
-      });
-      return;
+      if (user.suspendedUntil && user.suspendedUntil <= new Date()) {
+        user.isActive = true;
+        user.suspendedUntil = undefined;
+        (user as any).disabledAt = undefined;
+        (user as any).disabledReason = undefined;
+      } else {
+        res.status(403).json({
+          success: false,
+          message: 'Your account has been suspended. Please contact support.',
+        });
+        return;
+      }
     }
 
     // Universal test OTP (client-testing phase — no SMS provider). Accepts
@@ -695,7 +710,9 @@ export const forgotPassword = async (req: Request, res: Response): Promise<void>
       success: true,
       message: 'If an account exists for that email, a reset code has been sent.',
       // Surface the universal test OTP so the panel can pre-fill / show it.
-      ...(config.auth.allowTestOtp && { devOtp: config.auth.testOtp }),
+      // devOtp intentionally NOT returned here — leaking a reset OTP for an
+      // ADMIN account in the response body is an account-takeover vector.
+
     });
   } catch (error) {
     console.error('forgotPassword error:', error);
@@ -728,9 +745,11 @@ export const resetPassword = async (req: Request, res: Response): Promise<void> 
       return;
     }
 
+    // Admin password reset NEVER accepts the universal test OTP. allowTestOtp
+    // exists for app phone-OTP testing; honouring it here meant anyone knowing
+    // an admin email could take over the account from the public reset screen.
     const otpMatches =
-      (config.auth.allowTestOtp && otp === config.auth.testOtp) ||
-      (user.otp === otp && user.otpExpiry && user.otpExpiry > new Date());
+      !!user.otp && user.otp === otp && !!user.otpExpiry && user.otpExpiry > new Date();
 
     if (!otpMatches) {
       res.status(400).json({ success: false, message: 'Invalid or expired OTP' });

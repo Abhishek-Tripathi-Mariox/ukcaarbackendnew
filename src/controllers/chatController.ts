@@ -1,18 +1,38 @@
 import { Response } from 'express';
-import { Chat, Ride } from '../models';
+import { isValidObjectId } from 'mongoose';
+import { Chat, Ride, ScheduledBooking } from '../models';
 import { AuthRequest } from '../middleware/auth';
 
 /**
+ * The two chat participants for a ride-or-booking id. Instant rides key chat
+ * by the Ride _id; scheduled shuttles have no Ride doc, so their chat is
+ * keyed by the ScheduledBooking _id instead. Returns null if neither exists.
+ */
+async function chatParticipants(
+  chatId: string,
+): Promise<{ customer?: any; driver?: any } | null> {
+  if (!isValidObjectId(chatId)) return null;
+  const ride = await Ride.findById(chatId).select('customer driver');
+  if (ride) return { customer: ride.customer, driver: ride.driver };
+  const booking = await ScheduledBooking.findById(chatId).select('customer driver');
+  if (booking) return { customer: booking.customer, driver: booking.driver };
+  return null;
+}
+
+/**
  * Returns true if the authenticated user is the customer or assigned driver
- * of the given ride. Admins are allowed through (they use the admin chat
- * viewer). Returns false if the ride doesn't exist.
+ * of the given ride/booking. Admins are allowed through (they use the admin
+ * chat viewer). Returns false if neither a ride nor a booking exists.
  */
 async function isRideParticipant(req: AuthRequest, rideId: string): Promise<boolean> {
   if (req.user?.role === 'admin') return true;
-  const ride = await Ride.findById(rideId).select('customer driver');
-  if (!ride) return false;
+  const parties = await chatParticipants(rideId);
+  if (!parties) return false;
   const uid = req.user!._id.toString();
-  return ride.customer?.toString() === uid || (!!ride.driver && ride.driver.toString() === uid);
+  return (
+    parties.customer?.toString() === uid ||
+    (!!parties.driver && parties.driver.toString() === uid)
+  );
 }
 
 /**
@@ -62,14 +82,14 @@ export const sendMessage = async (req: AuthRequest, res: Response): Promise<void
 
     let chat = await Chat.findOne({ ride: req.params.rideId });
     if (!chat) {
-      const ride = await Ride.findById(req.params.rideId);
-      if (!ride) {
+      const parties = await chatParticipants(req.params.rideId);
+      if (!parties) {
         res.status(404).json({ success: false, message: 'Ride not found' });
         return;
       }
       chat = await Chat.create({
-        ride: ride._id,
-        participants: [ride.customer, ride.driver].filter(Boolean),
+        ride: req.params.rideId,
+        participants: [parties.customer, parties.driver].filter(Boolean),
         messages: [],
       });
     }

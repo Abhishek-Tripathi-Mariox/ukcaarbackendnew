@@ -2,7 +2,7 @@ import { Router, Request, Response } from 'express';
 import mongoose from 'mongoose';
 import { APPROVED_DRIVER_QUERY, driverWorkBlockReason } from '../middleware/driverApproval';
 import { istDateStr } from '../utils/date';
-import { User, Ride, Payment, Wallet, Chat, PromoCode, Notification } from '../models';
+import { User, Ride, Payment, Wallet, Chat, PromoCode, Notification, SupportTicket } from '../models';
 import { sendPushToTokens } from '../config/firebase';
 import { authenticate, authorize, requirePermission } from '../middleware/auth';
 import { auditLog } from '../middleware/audit';
@@ -283,6 +283,171 @@ router.get('/analytics/revenue', async (req: Request, res: Response) => {
     });
   } catch (error) {
     res.status(500).json({ success: false, message: 'Revenue analytics failed' });
+  }
+});
+
+/**
+ * GET /api/v1/admin/alerts
+ * Standing operational alerts for the header alerts panel: pending driver
+ * applications, re-uploaded documents awaiting review, open disputes and
+ * unassigned support tickets. Each group carries a count plus up to 5 most
+ * recent items and a deep-link target in the admin UI.
+ */
+router.get('/alerts', async (_req: Request, res: Response) => {
+  try {
+    const now = new Date();
+    const RECENT = 5;
+
+    const pendingAppFilter: Record<string, any> = {
+      role: 'driver',
+      'driverProfile.registrationStep': 'pending',
+    };
+    const resubmitFilter: Record<string, any> = {
+      role: 'driver',
+      'driverProfile.documents': {
+        $elemMatch: { resubmittedAt: { $exists: true }, status: 'pending' },
+      },
+    };
+    // Same flagging rules as the open queue in GET /rides/disputed.
+    const disputeFilter: Record<string, any> = {
+      'dispute.resolved': { $ne: true },
+      $or: [
+        { 'rating.customerToDriver': { $lte: 2 } },
+        { 'rating.driverToCustomer': { $lte: 2 } },
+        { status: 'cancelled', 'cancellation.fee': { $gt: 0 } },
+      ],
+    };
+    // null also matches a missing assignedTo — i.e. any unassigned ticket.
+    const ticketFilter: Record<string, any> = {
+      status: { $in: ['open', 'pending_user'] },
+      assignedTo: null,
+    };
+
+    const [
+      pendingAppCount,
+      pendingApps,
+      resubmitCount,
+      resubmitDrivers,
+      disputeCount,
+      disputes,
+      ticketCount,
+      tickets,
+      breachedSla,
+    ] = await Promise.all([
+      User.countDocuments(pendingAppFilter),
+      User.find(pendingAppFilter)
+        .select('firstName lastName phone updatedAt')
+        .sort({ updatedAt: -1 })
+        .limit(RECENT)
+        .lean(),
+      User.countDocuments(resubmitFilter),
+      User.find(resubmitFilter)
+        .select('firstName lastName driverProfile.documents updatedAt')
+        .sort({ updatedAt: -1 })
+        .limit(RECENT)
+        .lean(),
+      Ride.countDocuments(disputeFilter),
+      Ride.find(disputeFilter)
+        .select('rating cancellation dispute status updatedAt')
+        .sort({ updatedAt: -1 })
+        .limit(RECENT)
+        .lean(),
+      SupportTicket.countDocuments(ticketFilter),
+      SupportTicket.find(ticketFilter)
+        .select('subject ticketNumber createdAt')
+        .sort({ createdAt: -1 })
+        .limit(RECENT)
+        .lean(),
+      SupportTicket.countDocuments({
+        slaDueAt: { $lt: now },
+        status: { $nin: ['resolved', 'closed'] },
+      }),
+    ]);
+
+    const pendingAppItems = pendingApps.map((u: any) => ({
+      id: String(u._id),
+      label: `${u.firstName ?? ''} ${u.lastName ?? ''}`.trim() || 'Driver',
+      sublabel: u.phone ?? '',
+      at: u.updatedAt,
+    }));
+
+    const resubmitItems = resubmitDrivers.map((u: any) => {
+      // `at` = latest resubmittedAt among the still-pending re-uploads.
+      const at = (u.driverProfile?.documents ?? [])
+        .filter((d: any) => d.resubmittedAt && d.status === 'pending')
+        .reduce(
+          (max: Date | null, d: any) => (!max || d.resubmittedAt > max ? d.resubmittedAt : max),
+          null
+        );
+      return {
+        id: String(u._id),
+        label: `${u.firstName ?? ''} ${u.lastName ?? ''}`.trim() || 'Driver',
+        sublabel: 'Document re-uploaded',
+        at: at ?? u.updatedAt,
+      };
+    });
+
+    const disputeItems = disputes.map((r: any) => {
+      const reasons: string[] = [];
+      if (r.rating?.customerToDriver != null && r.rating.customerToDriver <= 2)
+        reasons.push('Customer rated driver ' + r.rating.customerToDriver + ' star(s)');
+      if (r.rating?.driverToCustomer != null && r.rating.driverToCustomer <= 2)
+        reasons.push('Driver rated customer ' + r.rating.driverToCustomer + ' star(s)');
+      if (r.status === 'cancelled' && (r.cancellation?.fee ?? 0) > 0)
+        reasons.push('Cancelled with a ₹' + r.cancellation.fee + ' fee');
+      return {
+        id: String(r._id),
+        label: 'Ride #' + String(r._id).slice(-6),
+        sublabel: r.dispute?.reason || reasons.join('; ') || 'Flagged for review',
+        at: r.updatedAt,
+      };
+    });
+
+    const ticketItems = tickets.map((t: any) => ({
+      id: String(t._id),
+      label: t.subject,
+      sublabel: t.ticketNumber,
+      at: t.createdAt,
+    }));
+
+    const groups = [
+      {
+        key: 'pendingApplications',
+        title: 'Pending driver applications',
+        count: pendingAppCount,
+        target: '/drivers?tab=applications',
+        items: pendingAppItems,
+      },
+      {
+        key: 'resubmittedDocs',
+        title: 'Re-uploaded documents',
+        count: resubmitCount,
+        target: '/drivers',
+        items: resubmitItems,
+      },
+      {
+        key: 'openDisputes',
+        title: 'Open disputes',
+        count: disputeCount,
+        target: '/rides?tab=disputes',
+        items: disputeItems,
+      },
+      {
+        key: 'openTickets',
+        title: 'Unassigned support tickets',
+        count: ticketCount,
+        target: '/support',
+        items: ticketItems,
+        breachedSla,
+      },
+    ];
+
+    res.status(200).json({
+      success: true,
+      data: { total: groups.reduce((sum, g) => sum + g.count, 0), groups },
+    });
+  } catch (error) {
+    res.status(500).json({ success: false, message: 'Failed to fetch alerts' });
   }
 });
 
@@ -2160,47 +2325,101 @@ router.put('/rides/scheduled/:bookingId/cancel', requirePermission(PERMISSIONS.M
       res.status(404).json({ success: false, message: 'Booking not found' });
       return;
     }
+    // Terminal statuses each get a specific rejection — the old guard only
+    // caught 'cancelled', so one admin click could re-refund a booking the
+    // expiry sweep had already refunded ('expired') or refund a settled trip
+    // ('completed').
     if (booking.status === 'cancelled') {
       res.status(400).json({ success: false, message: 'Booking already cancelled' });
       return;
     }
+    if (booking.status === 'expired') {
+      res.status(400).json({ success: false, message: 'Already expired and refunded automatically.' });
+      return;
+    }
+    if (booking.status === 'completed') {
+      res.status(400).json({ success: false, message: 'Trip already completed — use the dispute/refund flow instead.' });
+      return;
+    }
 
-    booking.status = 'cancelled';
-    booking.cancellation = {
-      cancelledBy: 'admin',
-      reason: reason || 'Cancelled by admin',
-      cancelledAt: new Date(),
-    };
-    await booking.save();
+    // Atomic claim, mirroring the customer-facing cancel: only the click that
+    // flips reserved→cancelled moves money, so a double-click, a second
+    // admin, or a race with the expiry sweep / trip completion can never
+    // refund twice. Boarded bookings are excluded — the rider rode, so any
+    // refund is dispute-flow territory.
+    const claimed = await ScheduledBooking.findOneAndUpdate(
+      {
+        _id: booking._id,
+        status: 'reserved',
+        $or: [{ boardedSeats: { $exists: false } }, { boardedSeats: { $size: 0 } }],
+      },
+      {
+        $set: {
+          status: 'cancelled',
+          cancellation: {
+            cancelledBy: 'admin',
+            reason: reason || 'Cancelled by admin',
+            cancelledAt: new Date(),
+          },
+        },
+      },
+      { new: true },
+    );
+    if (!claimed) {
+      const fresh = await ScheduledBooking.findById(cleanId).lean();
+      const msg =
+        fresh?.status === 'cancelled'
+          ? 'Booking already cancelled'
+          : fresh?.status === 'expired'
+            ? 'Already expired and refunded automatically.'
+            : fresh?.status === 'completed'
+              ? 'Trip already completed — use the dispute/refund flow instead.'
+              : (fresh?.boardedSeats?.length ?? 0) > 0
+                ? 'Passenger has already boarded — use the dispute/refund flow instead.'
+                : 'Unable to cancel this booking.';
+      res.status(400).json({ success: false, message: msg });
+      return;
+    }
 
     // Refund wallet-paid bookings, mirroring the customer-facing cancel. Admin
     // cancels previously flipped status + freed seats but never refunded, so a
     // wallet-paying rider silently lost the fare when support cancelled.
+    // Refund only the REMAINDER (early drops may have partially refunded) and
+    // record it on the booking so nothing can pay the same money out again.
     let walletBalanceAfter: number | undefined;
-    if (booking.paymentMethod === 'wallet' && booking.totalAmount > 0) {
+    const refundAmt = Math.max(
+      0,
+      (claimed.totalAmount ?? 0) - (claimed.refundedAmount ?? 0),
+    );
+    if (claimed.paymentMethod === 'wallet' && refundAmt > 0) {
       const { Wallet, Payment } = await import('../models');
       const refunded = await Wallet.findOneAndUpdate(
-        { user: booking.customer },
-        { $inc: { balance: booking.totalAmount } },
+        { user: claimed.customer },
+        { $inc: { balance: refundAmt } },
         { new: true, upsert: true },
       );
       walletBalanceAfter = refunded.balance;
+      await ScheduledBooking.updateOne(
+        { _id: claimed._id },
+        { $set: { refundedAmount: claimed.totalAmount ?? 0 } },
+      );
+      claimed.refundedAmount = claimed.totalAmount ?? 0;
       try {
         await Payment.create({
-          user: booking.customer,
+          user: claimed.customer,
           type: 'refund',
-          amount: booking.totalAmount,
+          amount: refundAmt,
           method: 'wallet',
           status: 'completed',
-          description: `Refund: admin-cancelled scheduled booking (${booking.seats.length} seat${booking.seats.length === 1 ? '' : 's'})`,
+          description: `Refund: admin-cancelled scheduled booking (${claimed.seats.length} seat${claimed.seats.length === 1 ? '' : 's'})`,
         });
       } catch (payErr) {
         console.warn('admin scheduled cancel: refund statement row failed:', payErr);
       }
     }
 
-    emitToUser(booking.customer.toString(), 'booking:cancelled', {
-      bookingId: String(booking._id),
+    emitToUser(claimed.customer.toString(), 'booking:cancelled', {
+      bookingId: String(claimed._id),
       reason,
       cancelledBy: 'admin',
       message: `Your scheduled seat has been cancelled by support. ${reason || ''}`.trim(),
@@ -2208,7 +2427,7 @@ router.put('/rides/scheduled/:bookingId/cancel', requirePermission(PERMISSIONS.M
 
     res.status(200).json({
       success: true,
-      data: { booking, ...(walletBalanceAfter !== undefined && { walletBalance: walletBalanceAfter }) },
+      data: { booking: claimed, ...(walletBalanceAfter !== undefined && { walletBalance: walletBalanceAfter }) },
       message: 'Booking cancelled',
     });
   } catch (error) {

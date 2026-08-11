@@ -117,6 +117,7 @@ export const config = {
     duration: 30, // days (legacy default)
     currency: 'INR',
     plans: {
+      daily: { label: 'Daily', price: 9, days: 1 },
       weekly: { label: 'Weekly', price: 49, days: 7 },
       monthly: { label: 'Monthly', price: 99.99, days: 30 },
       annual: { label: 'Annual', price: 999, days: 365 },

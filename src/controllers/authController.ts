@@ -257,7 +257,13 @@ export const refreshToken = async (req: Request, res: Response): Promise<void> =
 export const logout = async (req: AuthRequest, res: Response): Promise<void> => {
   try {
     if (req.user) {
-      await User.findByIdAndUpdate(req.user._id, { refreshToken: null });
+      // Also force the driver offline: a driver who logged out while online
+      // stayed isOnline:true forever, so the admin panel showed them active
+      // and dispatch kept considering them.
+      await User.findByIdAndUpdate(req.user._id, {
+        refreshToken: null,
+        'driverProfile.isOnline': false,
+      });
     }
     res.status(200).json({ success: true, message: 'Logged out successfully' });
   } catch (error) {

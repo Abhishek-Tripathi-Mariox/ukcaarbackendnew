@@ -277,16 +277,32 @@ export const initializeSocket = (httpServer: HttpServer): SocketServer => {
 
         // Persist + push. Lazy-import to avoid pulling models/fcmController
         // into the socket module's load-time graph.
-        const { Chat, Ride } = await import('../models');
+        const { Chat, Ride, ScheduledBooking } = await import('../models');
         const { sendPushToUser } = await import('../controllers/fcmController');
+        const { isValidObjectId } = await import('mongoose');
+
+        // Non-ObjectId room keys can't be persisted (Chat.ride is an
+        // ObjectId) — the live echo above already happened, so just stop.
+        if (!isValidObjectId(data.rideId)) return;
 
         let chat = await Chat.findOne({ ride: data.rideId });
         if (!chat) {
+          // Scheduled shuttles have no Ride doc — their chat is keyed by the
+          // ScheduledBooking _id instead, with the same two participants.
           const ride = await Ride.findById(data.rideId).select('customer driver');
-          if (!ride) return;
+          let participants = ride
+            ? [ride.customer, ride.driver].filter(Boolean)
+            : null;
+          if (!participants) {
+            const booking = await ScheduledBooking.findById(data.rideId).select(
+              'customer driver',
+            );
+            if (!booking) return;
+            participants = [booking.customer, booking.driver].filter(Boolean);
+          }
           chat = await Chat.create({
-            ride: ride._id,
-            participants: [ride.customer, ride.driver].filter(Boolean),
+            ride: data.rideId,
+            participants,
             messages: [],
           });
         }

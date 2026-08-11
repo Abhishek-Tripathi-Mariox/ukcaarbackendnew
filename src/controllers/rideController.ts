@@ -16,6 +16,7 @@ import {
   consumeRedemption,
 } from '../services/loyaltyEngine';
 import { safeResolveSurge, isPickupBlocked } from '../services/surge';
+import { sweepExpiredScheduled } from '../services/scheduledSweep';
 import { getRouteEstimate } from '../services/routing';
 import { emitToUser, emitToRide, notifyNearbyDrivers } from '../socket';
 import { sendPushToUser } from './fcmController';
@@ -83,7 +84,9 @@ async function takeDispatchedDrivers(
  * 'searching' forever until the customer cancels. Acceptable given the
  * 5-minute window: a restart that long means bigger problems.
  */
-const AUTO_CANCEL_MS = 5 * 60 * 1000;
+// 3 minutes: if no driver accepts within this window the ride flips to
+// cancelled and the customer app shows "couldn't find a driver in time".
+const AUTO_CANCEL_MS = 3 * 60 * 1000;
 const autoCancelTimers = new Map<string, NodeJS.Timeout>();
 
 export function clearAutoCancel(rideId: string): void {
@@ -175,12 +178,24 @@ export async function sweepStaleSearchingRides(): Promise<number> {
 }
 
 let rideSweepTimer: NodeJS.Timeout | null = null;
+// The scheduled-shuttle expiry sweep (expire past-date reserved bookings +
+// refund the money) only needs to run hourly — it piggybacks on the 60s ride
+// interval below via this timestamp instead of owning a second timer.
+const SCHEDULED_SWEEP_EVERY_MS = 60 * 60 * 1000;
+let lastScheduledSweepAt = 0;
 /** Start the periodic stale-ride sweep. Call once after the DB connects. */
 export function startRideMaintenance(): void {
   if (rideSweepTimer) return;
   sweepStaleSearchingRides().catch((e) => console.error('[auto-cancel sweep] boot run failed:', e));
+  // Boot run recovers bookings orphaned while the process was down.
+  lastScheduledSweepAt = Date.now();
+  sweepExpiredScheduled().catch((e) => console.error('[scheduled sweep] boot run failed:', e));
   rideSweepTimer = setInterval(() => {
     sweepStaleSearchingRides().catch((e) => console.error('[auto-cancel sweep] failed:', e));
+    if (Date.now() - lastScheduledSweepAt >= SCHEDULED_SWEEP_EVERY_MS) {
+      lastScheduledSweepAt = Date.now();
+      sweepExpiredScheduled().catch((e) => console.error('[scheduled sweep] failed:', e));
+    }
   }, 60 * 1000);
   rideSweepTimer.unref?.();
 }
@@ -1294,11 +1309,15 @@ export const getRides = async (req: AuthRequest, res: Response): Promise<void> =
     if (includeBookings && req.user?._id) {
       bookingFilter.$or = [{ customer: req.user._id }, { driver: req.user._id }];
       if (req.query.status === 'cancelled') {
-        bookingFilter.status = 'cancelled';
+        // 'expired' projects to a cancelled-shaped row below, so the
+        // cancelled tab must include it too.
+        bookingFilter.status = { $in: ['cancelled', 'expired'] };
       } else if (req.query.status === 'completed') {
         bookingFilter.status = 'completed';
       } else {
-        bookingFilter.status = { $in: ['reserved', 'completed', 'cancelled'] };
+        // 'expired' included so sweep-expired bookings (and their refund)
+        // stay visible in Activity history instead of vanishing.
+        bookingFilter.status = { $in: ['reserved', 'completed', 'cancelled', 'expired'] };
       }
     }
 
@@ -1398,13 +1417,24 @@ export const getRides = async (req: AuthRequest, res: Response): Promise<void> =
         isScheduled: true,
         isActiveNow,
         status:
-          b.status === 'cancelled'
+          b.status === 'cancelled' || b.status === 'expired'
             ? 'cancelled'
             : b.status === 'completed'
               ? 'completed'
               : isActiveNow
                 ? 'in_progress'
                 : 'driver_assigned',
+        // Sweep-expired bookings render as system-cancelled rows so the trip
+        // and its refundedAmount stay visible; real cancellations pass their
+        // stored record through (Ride rows carry `cancellation` top-level).
+        cancellation:
+          b.status === 'expired'
+            ? {
+                cancelledBy: 'system',
+                reason: 'Trip did not run. Fare refunded.',
+                cancelledAt: b.updatedAt ?? b.createdAt,
+              }
+            : (b.cancellation ?? null),
         pickup: first
           ? {
               address: first.name ?? first.address ?? 'Stop 1',
@@ -1901,6 +1931,16 @@ export const updateRideStatus = async (req: AuthRequest, res: Response): Promise
       return;
     }
 
+    // Idempotent same-status call: the geofence auto-transition (socket
+    // driver:location) often flips the ride to driver_arrived moments before
+    // the driver taps "I've arrived". That tap used to 400 ("Cannot
+    // transition from driver_arrived to driver_arrived") and the app showed
+    // a spurious failure. Treat it as success with no side effects.
+    if (ride.status === status) {
+      res.status(200).json({ success: true, data: { ride } });
+      return;
+    }
+
     if (!validTransitions[ride.status]?.includes(status)) {
       res.status(400).json({
         success: false,
@@ -1946,6 +1986,30 @@ export const updateRideStatus = async (req: AuthRequest, res: Response): Promise
       status,
       ride,
     });
+
+    // Manual "I've arrived" must reach a backgrounded rider too — the
+    // geofence auto-arrival path (socket driver:location) already sends this
+    // push, but this REST path didn't, so a driver-tapped arrival was
+    // invisible unless the customer app was foregrounded.
+    if (status === 'driver_arrived') {
+      (async () => {
+        const { templatedCopy } = await import('../services/notificationTemplate');
+        const arrivedCopy = await templatedCopy(
+          'ride.driver_arrived',
+          {},
+          { title: 'Your driver has arrived', body: 'They are waiting at your pickup point.' },
+        );
+        await sendPushToUser(String(ride.customer), {
+          title: arrivedCopy.title,
+          body: arrivedCopy.body,
+          data: {
+            kind: 'ride:status',
+            rideId: String(ride._id),
+            status: 'driver_arrived',
+          },
+        });
+      })().catch(err => console.warn('[ride] arrived push failed:', err));
+    }
 
     res.status(200).json({ success: true, data: { ride } });
   } catch (error) {

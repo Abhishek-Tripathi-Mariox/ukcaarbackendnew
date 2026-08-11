@@ -34,34 +34,100 @@ function validateStops(stops: any): string | null {
   return null;
 }
 
-function validateSchedule(schedule: any): string | null {
-  if (!schedule) return null;
+/**
+ * Admin-tunable timing knobs on schedule. All optional — absent means "use
+ * the platform default" (see utils/scheduleTiming.ts). Ranges mirror the
+ * Route model schema so a clear message fires before Mongoose's terse one.
+ */
+const SCHEDULE_TIMING_LIMITS = [
+  { key: 'bookingCutoffMinutes', min: 0, max: 720 },
+  { key: 'maxAdvanceBookingDays', min: 1, max: 60 },
+  { key: 'startWindowMinutes', min: 5, max: 720 },
+  { key: 'minRestMinutes', min: 0, max: 1440 },
+  { key: 'cancellationCutoffMinutes', min: 0, max: 1440 },
+] as const;
+
+function validateDepartureList(
+  list: any,
+  label: string,
+  stopCount: number
+): string | null {
+  if (!Array.isArray(list)) return `schedule.${label} must be an array`;
+  for (let i = 0; i < list.length; i++) {
+    const d = list[i];
+    if (!d || typeof d !== 'object') return `schedule.${label}[${i}] invalid`;
+    if (!Number.isInteger(d.stopIndex) || d.stopIndex < 0)
+      return `schedule.${label}[${i}].stopIndex invalid`;
+    if (d.stopIndex >= stopCount)
+      return `schedule.${label}[${i}].stopIndex points past the last stop (this route has ${stopCount} stops)`;
+    if (typeof d.time !== 'string' || !/^([01]\d|2[0-3]):[0-5]\d$/.test(d.time))
+      return `schedule.${label}[${i}].time must be HH:mm`;
+  }
+  return null;
+}
+
+function validateSchedule(
+  schedule: any,
+  opts: { isScheduled: boolean; stopCount: number }
+): string | null {
+  if (!schedule) {
+    return opts.isScheduled
+      ? 'A scheduled route needs a schedule with at least one departure'
+      : null;
+  }
   if (typeof schedule !== 'object') return 'schedule must be an object';
-  if (schedule.daysOfWeek && !Array.isArray(schedule.daysOfWeek))
+
+  if (schedule.daysOfWeek !== undefined && !Array.isArray(schedule.daysOfWeek))
     return 'schedule.daysOfWeek must be an array';
   if (Array.isArray(schedule.daysOfWeek)) {
     for (const d of schedule.daysOfWeek) {
-      if (typeof d !== 'number' || d < 0 || d > 6)
-        return 'schedule.daysOfWeek values must be 0-6';
+      if (!Number.isInteger(d) || d < 0 || d > 6)
+        return 'schedule.daysOfWeek values must be integers 0 (Sunday) through 6 (Saturday)';
     }
   }
-  if (schedule.departures) {
-    if (!Array.isArray(schedule.departures))
-      return 'schedule.departures must be an array';
-    for (let i = 0; i < schedule.departures.length; i++) {
-      const d = schedule.departures[i];
-      if (!d || typeof d !== 'object') return `schedule.departures[${i}] invalid`;
-      if (typeof d.stopIndex !== 'number' || d.stopIndex < 0)
-        return `schedule.departures[${i}].stopIndex invalid`;
-      if (typeof d.time !== 'string' || !/^([01]\d|2[0-3]):[0-5]\d$/.test(d.time))
-        return `schedule.departures[${i}].time must be HH:mm`;
-    }
+  // An empty daysOfWeek used to silently invert to "runs every day" further
+  // down the stack — require an explicit choice for scheduled routes.
+  if (
+    opts.isScheduled &&
+    !(Array.isArray(schedule.daysOfWeek) && schedule.daysOfWeek.length > 0)
+  )
+    return 'A scheduled route must run on at least one day of the week';
+
+  if (schedule.departures !== undefined) {
+    const e = validateDepartureList(
+      schedule.departures,
+      'departures',
+      opts.stopCount
+    );
+    if (e) return e;
   }
+  if (
+    opts.isScheduled &&
+    !(Array.isArray(schedule.departures) && schedule.departures.length > 0)
+  )
+    return 'A scheduled route needs at least one departure time';
+
+  if (schedule.returnDepartures !== undefined && schedule.returnDepartures !== null) {
+    const e = validateDepartureList(
+      schedule.returnDepartures,
+      'returnDepartures',
+      opts.stopCount
+    );
+    if (e) return e;
+  }
+
   if (
     schedule.seatPrice !== undefined &&
     (typeof schedule.seatPrice !== 'number' || schedule.seatPrice < 0)
   )
     return 'schedule.seatPrice must be a non-negative number';
+
+  for (const { key, min, max } of SCHEDULE_TIMING_LIMITS) {
+    const v = schedule[key];
+    if (v === undefined || v === null) continue;
+    if (typeof v !== 'number' || !Number.isInteger(v) || v < min || v > max)
+      return `schedule.${key} must be a whole number between ${min} and ${max}, or omitted to use the platform default`;
+  }
   return null;
 }
 
@@ -164,7 +230,10 @@ router.post(
         res.status(400).json({ success: false, message: stopsErr });
         return;
       }
-      const schedErr = validateSchedule(body.schedule);
+      const schedErr = validateSchedule(body.schedule, {
+        isScheduled: body.type === 'scheduled',
+        stopCount: body.stops.length,
+      });
       if (schedErr) {
         res.status(400).json({ success: false, message: schedErr });
         return;
@@ -192,6 +261,11 @@ router.patch(
   async (req: Request, res: Response) => {
     try {
       const body = normaliseBody(req.body);
+      const existing = await Route.findById(req.params.id);
+      if (!existing) {
+        res.status(404).json({ success: false, message: 'Route not found' });
+        return;
+      }
       if (body.stops) {
         const e = validateStops(body.stops);
         if (e) {
@@ -199,8 +273,28 @@ router.patch(
           return;
         }
       }
-      if (body.schedule) {
-        const e = validateSchedule(body.schedule);
+      // Validate the schedule against the EFFECTIVE post-update state: a
+      // patch that shrinks stops (or flips the type) without resending the
+      // schedule must not leave departures pointing past the last stop.
+      if (
+        body.schedule !== undefined ||
+        body.stops !== undefined ||
+        body.type !== undefined
+      ) {
+        const effectiveType = body.type ?? existing.type;
+        const effectiveStops = Array.isArray(body.stops)
+          ? body.stops
+          : existing.stops ?? [];
+        const rawSchedule =
+          body.schedule !== undefined ? body.schedule : existing.schedule;
+        const effectiveSchedule =
+          rawSchedule && typeof (rawSchedule as any).toObject === 'function'
+            ? (rawSchedule as any).toObject()
+            : rawSchedule;
+        const e = validateSchedule(effectiveSchedule, {
+          isScheduled: effectiveType === 'scheduled',
+          stopCount: effectiveStops.length,
+        });
         if (e) {
           res.status(400).json({ success: false, message: e });
           return;

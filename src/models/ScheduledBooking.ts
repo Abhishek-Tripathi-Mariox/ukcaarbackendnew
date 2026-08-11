@@ -37,7 +37,9 @@ export interface IScheduledBooking extends Document {
    *  (the booking flow only had them in nav params before). */
   passengers?: { seat: number; name: string; contact?: string }[];
   customer: Types.ObjectId;
-  status: 'reserved' | 'cancelled' | 'completed';
+  /** 'expired' = the trip date passed without the journey ever running; set by
+   *  the maintenance sweep, which also auto-refunds the unridden amount. */
+  status: 'reserved' | 'cancelled' | 'completed' | 'expired';
   totalAmount: number;
   /** How the rider paid. 'wallet' bookings are auto-refunded to the wallet on
    *  cancel; 'razorpay' refunds are handled by support/admin out of band.
@@ -111,7 +113,16 @@ const scheduledBookingSchema = new Schema<IScheduledBooking>(
     departureDate: {
       type: String,
       required: true,
-      match: /^\d{4}-\d{2}-\d{2}$/,
+      validate: {
+        // Regex-only validation let impossible dates ('2026-02-31') through;
+        // those rows never match a real istDateStr() and live forever.
+        validator: (v: string) => {
+          if (!/^\d{4}-\d{2}-\d{2}$/.test(v)) return false;
+          const d = new Date(`${v}T00:00:00Z`);
+          return !isNaN(d.getTime()) && d.toISOString().slice(0, 10) === v;
+        },
+        message: 'departureDate must be a real calendar date (YYYY-MM-DD)',
+      },
     },
     departureIndex: { type: Number, required: true, min: 0 },
     driver: { type: Schema.Types.ObjectId, ref: 'User' },
@@ -136,7 +147,7 @@ const scheduledBookingSchema = new Schema<IScheduledBooking>(
     customer: { type: Schema.Types.ObjectId, ref: 'User', required: true, index: true },
     status: {
       type: String,
-      enum: ['reserved', 'cancelled', 'completed'],
+      enum: ['reserved', 'cancelled', 'completed', 'expired'],
       default: 'reserved',
       index: true,
     },

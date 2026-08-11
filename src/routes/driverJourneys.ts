@@ -15,7 +15,15 @@ import { requireApprovedDriver } from '../middleware/driverApproval';
 import { config } from '../config';
 import { emitToUser } from '../socket';
 import { distanceMeters } from '../utils/routeCorridor';
-import { istDateStr, istWeekday, istDateStrPlusDays } from '../utils/date';
+import {
+  istDateStr,
+  istWeekday,
+  istDateStrPlusDays,
+  isValidCalendarDate,
+  departureEpochMs,
+  minutesUntilDeparture,
+} from '../utils/date';
+import { getScheduleTiming } from '../utils/scheduleTiming';
 
 const router = Router();
 router.use(authenticate);
@@ -35,7 +43,9 @@ function parseKey(key: string): { routeId: string; index: number; date: string }
   if (!mongoose.isValidObjectId(routeId)) return null;
   const index = Number(idxStr);
   if (!Number.isInteger(index) || index < 0) return null;
-  if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) return null;
+  // Real calendar date only — a plain regex accepts impossible dates like
+  // 2026-02-31, which the resolveJourney upsert would then persist forever.
+  if (!isValidCalendarDate(date)) return null;
   return { routeId, index, date };
 }
 
@@ -65,6 +75,52 @@ function departureTime(routeDoc: any, index: number): string {
   return dep?.time ?? '';
 }
 
+/** Format an epoch instant as an IST clock time for user-facing messages. */
+function istClock(ms: number): string {
+  return new Date(ms).toLocaleTimeString('en-IN', {
+    timeZone: 'Asia/Kolkata',
+    hour: '2-digit',
+    minute: '2-digit',
+  });
+}
+
+/** The journey doc for a key + driver, but only if the driver has actually
+ *  started it (status active/in_progress). The passenger-work endpoints
+ *  (check-in, QR, no-show, drop) require this so every run funnels through the
+ *  approval-gated /start. Deliberately does NOT re-check driver approval —
+ *  a driver who loses approval mid-run can still finish the trip. */
+async function findRunningJourney(
+  parsed: { routeId: string; index: number; date: string },
+  driverId: any,
+): Promise<IDriverJourney | null> {
+  return DriverJourney.findOne({
+    route: parsed.routeId,
+    driver: driverId,
+    departureIndex: parsed.index,
+    departureDate: parsed.date,
+    status: { $in: ['active', 'in_progress'] },
+  });
+}
+
+/** User-facing single-active-journey rejection. Names the trip that blocks
+ *  ("Finish your current journey (Route X, 2026-08-10) before starting
+ *  another.") when the route resolves; falls back to the generic wording. */
+async function singleActiveMessage(blocking: {
+  route?: any;
+  departureDate?: string;
+}): Promise<string> {
+  const generic = 'Finish your current journey before starting another.';
+  try {
+    const blockingRoute = await Route.findById(blocking?.route).select('name').lean();
+    const name = blockingRoute?.name;
+    return name && blocking?.departureDate
+      ? `Finish your current journey (${name}, ${blocking.departureDate}) before starting another.`
+      : generic;
+  } catch {
+    return generic;
+  }
+}
+
 /** Shape a journey for the list/detail responses. */
 async function shapeJourney(
   routeDoc: any,
@@ -73,16 +129,25 @@ async function shapeJourney(
   date: string,
   journey: IDriverJourney | null,
 ) {
+  // 'expired' bookings stay in the count — an expired trip on the past tab
+  // must still show how many passengers it had, not zero.
   const bookings = await ScheduledBooking.find({
     route: routeDoc._id,
     driver: driverId,
     departureIndex: index,
     departureDate: date,
-    status: { $in: ['reserved', 'completed'] },
+    status: { $in: ['reserved', 'completed', 'expired'] },
   }).lean();
 
   const passengerCount = bookings.reduce((n, b) => n + (b.seats?.length ?? 0), 0);
   const boardedCount = bookings.reduce((n, b) => n + (b.boardedSeats?.length ?? 0), 0);
+
+  // A journey that never advanced past 'scheduled' (or never got a doc at
+  // all) whose date has passed is a missed trip — report it as 'expired' so
+  // the app's past tab badges it correctly even before the maintenance sweep
+  // flips the doc.
+  const rawStatus = journey?.status ?? 'scheduled';
+  const status = rawStatus === 'scheduled' && date < istDateStr() ? 'expired' : rawStatus;
 
   return {
     journeyKey: makeKey(routeDoc._id, index, date),
@@ -94,9 +159,13 @@ async function shapeJourney(
     departureDate: date,
     departureIndex: index,
     departureTime: departureTime(routeDoc, index),
+    // How many minutes before departure the driver may start this journey
+    // (route override or platform default) — lets the app gate its Start
+    // button client-side to match the server's /start window guard.
+    startWindowMinutes: getScheduleTiming(routeDoc?.schedule).startWindowMinutes,
     seatPrice: routeDoc.schedule?.seatPrice ?? 0,
     totalSeats: routeDoc.schedule?.totalSeats ?? 0,
-    status: journey?.status ?? 'scheduled',
+    status,
     currentStopIndex: journey?.currentStopIndex ?? 0,
     passengerCount,
     boardedCount,
@@ -513,7 +582,9 @@ router.get('/', async (req: AuthRequest, res: Response) => {
     for (const r of routesToCheck) {
       const departures = r.schedule?.departures || [];
       const daysOfWeek = r.schedule?.daysOfWeek || [0, 1, 2, 3, 4, 5, 6];
-      for (let dayOffset = 0; dayOffset <= 7; dayOffset++) {
+      // Drivers only see the next 2 days of scheduled journeys (client
+      // request) — further dates stay hidden until they roll into the window.
+      for (let dayOffset = 0; dayOffset <= 2; dayOffset++) {
         const instant = new Date(now.getTime() + dayOffset * 24 * 60 * 60 * 1000);
         // IST weekday + IST date — the route's daysOfWeek and the booking dates
         // are both IST-calendar values. Using server-local getDay()/UTC
@@ -535,11 +606,33 @@ router.get('/', async (req: AuthRequest, res: Response) => {
     const isPast = (g: any): boolean => {
       const key = makeKey(g._id.route, g._id.departureIndex, g._id.departureDate);
       const status = (jMap.get(key) as IDriverJourney | undefined)?.status;
-      if (status === 'completed' || status === 'cancelled') return true;
+      // A running journey is NEVER past regardless of date — a trip that
+      // crosses midnight must stay resumable from the upcoming tab.
+      if (status === 'active' || status === 'in_progress') return false;
+      // Terminal states are always past ('expired' = date passed unstarted).
+      if (status === 'completed' || status === 'cancelled' || status === 'expired') return true;
       return g._id.departureDate < todayStr;
     };
 
-    const filtered = groups.filter((g) => (scope === 'past' ? isPast(g) : !isPast(g)));
+    // Upcoming is capped at today+2 (IST): bookings can exist for later
+    // dates, but the driver shouldn't see them until they enter the window.
+    // A running (active/in_progress) journey is exempt from the cap, mirroring
+    // the isPast exemption — a legacy future-dated doc that is already on the
+    // road must not be stranded off BOTH tabs.
+    const maxUpcomingStr = istDateStrPlusDays(2, new Date());
+    const isRunning = (g: any): boolean => {
+      const status = (
+        jMap.get(makeKey(g._id.route, g._id.departureIndex, g._id.departureDate)) as
+          | IDriverJourney
+          | undefined
+      )?.status;
+      return status === 'active' || status === 'in_progress';
+    };
+    const filtered = groups.filter((g) =>
+      scope === 'past'
+        ? isPast(g)
+        : !isPast(g) && (isRunning(g) || g._id.departureDate <= maxUpcomingStr),
+    );
 
     const routeIds = [...new Set(filtered.map((g) => String(g._id.route)))];
     const routes = await Route.find({ _id: { $in: routeIds } }).lean();
@@ -675,8 +768,9 @@ router.get('/:key/passengers', async (req: AuthRequest, res: Response) => {
  * Activate the journey (status -> active, position at the boarding stop).
  *
  * Approval-gated: this is where a shuttle run *begins*. The check-in / drop /
- * complete endpoints below are intentionally left open so a driver rejected
- * mid-run can still finish the trip they already have passengers on.
+ * complete endpoints below don't re-check approval — a driver rejected mid-run
+ * can still finish the trip they already have passengers on — but they DO
+ * require the journey to have been started here first.
  */
 router.post('/:key/start', requireApprovedDriver, async (req: AuthRequest, res: Response) => {
   try {
@@ -690,23 +784,144 @@ router.post('/:key/start', requireApprovedDriver, async (req: AuthRequest, res: 
       res.status(400).json({ success: false, message: 'Journey already finished' });
       return;
     }
-    // A trip can't be started before its scheduled date — that's how a
-    // tomorrow trip was being completed today and polluting the lists.
-    if (parsed.date > istDateStr()) {
+    if (journey.status === 'expired') {
       res.status(400).json({
         success: false,
-        message: 'This journey is scheduled for a future date and cannot be started yet.',
+        message: "This journey's scheduled date has passed and it can no longer be started.",
       });
       return;
     }
+    // Route loaded up front — the timing guards and the boarding stop need it.
     const routeDoc = await Route.findById(parsed.routeId).lean();
     const boardingStopIndex = routeDoc?.schedule?.departures?.[parsed.index]?.stopIndex ?? 0;
 
+    // The timing guards apply ONLY to a not-yet-started journey. A journey
+    // already active/in_progress falls through to the idempotent success
+    // below so an app resume mid-run never breaks.
     if (journey.status === 'scheduled') {
-      journey.status = 'active';
-      journey.startedAt = new Date();
-      journey.currentStopIndex = boardingStopIndex;
-      await journey.save();
+      const todayStr = istDateStr();
+
+      // Start window FIRST: the journey may go active only within N minutes
+      // of its slot's departure instant (route override or platform default).
+      // A strict string future-date rejection used to run before this, which
+      // made a just-after-midnight slot unstartable during the late-night
+      // part of its own window (a 00:10 slot at 23:40 the night before).
+      const depTime = routeDoc?.schedule?.departures?.[parsed.index]?.time;
+      if (typeof depTime !== 'string' || !depTime) {
+        res.status(400).json({ success: false, message: 'Invalid departure slot' });
+        return;
+      }
+      const depMs = departureEpochMs(parsed.date, depTime);
+      if (Number.isNaN(depMs)) {
+        res.status(400).json({ success: false, message: 'Invalid departure slot' });
+        return;
+      }
+      const timing = getScheduleTiming(routeDoc?.schedule);
+      const windowOpenMs = depMs - timing.startWindowMinutes * 60000;
+      if (Date.now() < windowOpenMs) {
+        res.status(400).json({
+          success: false,
+          message:
+            parsed.date > todayStr
+              ? `This journey is scheduled for ${parsed.date} and can be started from ${istClock(windowOpenMs)}.`
+              : `This journey can be started from ${istClock(windowOpenMs)} (${timing.startWindowMinutes} minutes before the ${istClock(depMs)} departure).`,
+        });
+        return;
+      }
+      // Past-date rejection AFTER the window check: a yesterday journey is
+      // always past its window-open instant so it reaches here, while a
+      // midnight-straddling window never trips it.
+      if (parsed.date < todayStr) {
+        res.status(400).json({
+          success: false,
+          message: "This journey's scheduled date has passed and it can no longer be started.",
+        });
+        return;
+      }
+
+      // One run at a time: finish the journey already on the road before
+      // going active on another.
+      const activeElsewhere = {
+        driver: req.user!._id,
+        status: { $in: ['active', 'in_progress'] },
+        _id: { $ne: journey._id },
+      };
+      const otherActive = await DriverJourney.findOne(activeElsewhere).lean();
+      if (otherActive) {
+        res.status(400).json({ success: false, message: await singleActiveMessage(otherActive) });
+        return;
+      }
+
+      // Mandatory rest after the previous trip. The rest requirement belongs
+      // to the route just driven — that is where the admin marks long routes.
+      const lastCompleted = await DriverJourney.findOne({
+        driver: req.user!._id,
+        status: 'completed',
+        completedAt: { $exists: true, $ne: null },
+      })
+        .sort({ completedAt: -1 })
+        .lean();
+      if (lastCompleted?.completedAt) {
+        const lastRoute = await Route.findById(lastCompleted.route).select('schedule').lean();
+        const restMinutes = getScheduleTiming(lastRoute?.schedule).minRestMinutes;
+        if (restMinutes > 0) {
+          const restedAtMs = new Date(lastCompleted.completedAt).getTime() + restMinutes * 60000;
+          if (Date.now() < restedAtMs) {
+            res.status(400).json({
+              success: false,
+              message: `Rest break required after your last trip. You can start your next journey at ${istClock(restedAtMs)}.`,
+            });
+            return;
+          }
+        }
+      }
+
+      // Atomic activation claim. The read-then-save it replaces let two
+      // parallel starts of DIFFERENT journeys both pass the single-active
+      // check above and both go active. Claim this journey while it is still
+      // 'scheduled', then re-verify nothing else activated in the gap; if
+      // something did, roll the claim back.
+      const claimed = await DriverJourney.findOneAndUpdate(
+        { _id: journey._id, status: 'scheduled' },
+        {
+          $set: {
+            status: 'active',
+            startedAt: new Date(),
+            currentStopIndex: boardingStopIndex,
+          },
+        },
+        { new: true },
+      );
+      if (!claimed) {
+        // A parallel request moved this journey out of 'scheduled' first.
+        const fresh = await DriverJourney.findById(journey._id).lean();
+        if (fresh && (fresh.status === 'active' || fresh.status === 'in_progress')) {
+          // Same journey started twice — idempotent success, matching the
+          // already-running fall-through below.
+          res.json({
+            success: true,
+            data: { status: fresh.status, currentStopIndex: fresh.currentStopIndex },
+          });
+        } else {
+          res.status(400).json({ success: false, message: 'This journey can no longer be started.' });
+        }
+        return;
+      }
+      const raceActive = await DriverJourney.findOne(activeElsewhere).lean();
+      if (raceActive) {
+        // A different journey went active between the check and our claim.
+        // Exactly one run may survive — release our claim and surface the
+        // journey that beat us to the road.
+        await DriverJourney.updateOne(
+          { _id: journey._id, status: 'active' },
+          { $set: { status: 'scheduled' }, $unset: { startedAt: 1 } },
+        );
+        res.status(400).json({ success: false, message: await singleActiveMessage(raceActive) });
+        return;
+      }
+      journey.status = claimed.status;
+      journey.startedAt = claimed.startedAt;
+      journey.currentStopIndex = claimed.currentStopIndex;
     }
     res.json({ success: true, data: { status: journey.status, currentStopIndex: journey.currentStopIndex } });
   } catch (err) {
@@ -796,6 +1011,13 @@ router.post('/:key/checkin', async (req: AuthRequest, res: Response) => {
     const parsed = parseKey(req.params.key);
     if (!parsed) {
       res.status(400).json({ success: false, message: 'Invalid journey' });
+      return;
+    }
+    if (!(await findRunningJourney(parsed, req.user!._id))) {
+      res.status(400).json({
+        success: false,
+        message: 'Start the journey before checking passengers in.',
+      });
       return;
     }
     const { bookingId, seats } = req.body || {};
@@ -925,6 +1147,13 @@ router.post('/:key/drop', async (req: AuthRequest, res: Response) => {
       res.status(400).json({ success: false, message: 'Invalid journey' });
       return;
     }
+    if (!(await findRunningJourney(parsed, req.user!._id))) {
+      res.status(400).json({
+        success: false,
+        message: 'Start the journey before dropping passengers.',
+      });
+      return;
+    }
     const { bookingId, seats } = req.body || {};
     const result = await earlyDropSeats(parsed, req.user!._id, bookingId, seats);
     if (!result.ok) {
@@ -950,6 +1179,28 @@ router.post('/:key/no-show', async (req: AuthRequest, res: Response) => {
       res.status(400).json({ success: false, message: 'Invalid journey' });
       return;
     }
+    if (!(await findRunningJourney(parsed, req.user!._id))) {
+      res.status(400).json({
+        success: false,
+        message: 'Start the journey before marking passengers absent.',
+      });
+      return;
+    }
+    // Absence can only be judged once the bus was due to leave — before the
+    // scheduled departure instant the rider may simply not have arrived yet.
+    const routeDoc = await Route.findById(parsed.routeId).select('schedule').lean();
+    const depTime = routeDoc?.schedule?.departures?.[parsed.index]?.time;
+    if (typeof depTime === 'string' && depTime) {
+      const minsToDeparture = minutesUntilDeparture(parsed.date, depTime);
+      if (minsToDeparture > 0) {
+        const depMs = departureEpochMs(parsed.date, depTime);
+        res.status(400).json({
+          success: false,
+          message: `Passengers can be marked absent only after the scheduled departure time (${istClock(depMs)}).`,
+        });
+        return;
+      }
+    }
     const { bookingId, seats } = req.body || {};
     const result = await noShowSeats(parsed, req.user!._id, bookingId, seats);
     if (!result.ok) {
@@ -972,6 +1223,14 @@ router.post('/:key/verify-qr', async (req: AuthRequest, res: Response) => {
     const parsed = parseKey(req.params.key);
     if (!parsed) {
       res.status(400).json({ success: false, message: 'Invalid journey' });
+      return;
+    }
+    if (!(await findRunningJourney(parsed, req.user!._id))) {
+      res.status(400).json({
+        success: false,
+        valid: false,
+        message: 'Start the journey before checking passengers in.',
+      });
       return;
     }
     const raw = req.body?.qr;
@@ -1021,6 +1280,15 @@ router.post('/:key/advance', async (req: AuthRequest, res: Response) => {
       res.status(400).json({ success: false, message: 'Journey already finished' });
       return;
     }
+    // Only a started journey moves between stops — advancing used to silently
+    // jump a never-started journey straight to in_progress, bypassing /start.
+    if (journey.status !== 'active' && journey.status !== 'in_progress') {
+      res.status(400).json({
+        success: false,
+        message: 'Start the journey before advancing to the next stop.',
+      });
+      return;
+    }
     const routeDoc = await Route.findById(parsed.routeId).lean();
     const lastStop = Math.max(0, (routeDoc?.stops?.length ?? 1) - 1);
 
@@ -1063,6 +1331,13 @@ router.post('/:key/complete', async (req: AuthRequest, res: Response) => {
       res.json({ success: true, data: { earnings: journey.earnings, alreadyCompleted: true } });
       return;
     }
+    // A never-started journey must not be settleable — /start is the only way
+    // in. A PAST-dated journey that IS running stays completable (a trip that
+    // crosses midnight is finished after its departure date).
+    if (journey.status !== 'active' && journey.status !== 'in_progress') {
+      res.status(400).json({ success: false, message: 'This journey was never started.' });
+      return;
+    }
     // Can't settle a trip before its scheduled date (defense-in-depth alongside
     // the start guard).
     if (parsed.date > istDateStr()) {
@@ -1071,6 +1346,24 @@ router.post('/:key/complete', async (req: AuthRequest, res: Response) => {
         message: 'This journey is scheduled for a future date and cannot be completed yet.',
       });
       return;
+    }
+    // A run may be STARTED up to startWindowMinutes early, but it must not be
+    // FINISHED before the bus was even due to leave — completing at window-open
+    // would flip every unboarded rider's booking to 'completed' with their fare
+    // unrecoverable. Mirrors the /no-show guard; fails open only when the slot
+    // time is missing/malformed (legacy data).
+    const completeRoute = await Route.findById(parsed.routeId).select('schedule').lean();
+    const completeDepTime = completeRoute?.schedule?.departures?.[parsed.index]?.time;
+    if (typeof completeDepTime === 'string' && completeDepTime) {
+      const minsToDeparture = minutesUntilDeparture(parsed.date, completeDepTime);
+      if (minsToDeparture > 0) {
+        const depMs = departureEpochMs(parsed.date, completeDepTime);
+        res.status(400).json({
+          success: false,
+          message: `The journey cannot be completed before its scheduled departure time (${istClock(depMs)}).`,
+        });
+        return;
+      }
     }
 
     const bookings = await ScheduledBooking.find({

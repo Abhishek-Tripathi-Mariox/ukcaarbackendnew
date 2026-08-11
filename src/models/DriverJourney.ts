@@ -10,7 +10,9 @@ import mongoose, { Document, Schema, Types } from 'mongoose';
  * (resolveOrCreate by the composite key). Uniqueness is enforced by the
  * compound index so a trip can never have two journey docs.
  */
-export type JourneyStatus = 'scheduled' | 'active' | 'in_progress' | 'completed' | 'cancelled';
+/** 'expired' = the scheduled date passed without the driver ever starting it
+ *  (set by the maintenance sweep; terminal like 'cancelled'). */
+export type JourneyStatus = 'scheduled' | 'active' | 'in_progress' | 'completed' | 'cancelled' | 'expired';
 
 export interface IDriverJourney extends Document {
   _id: Types.ObjectId;
@@ -34,10 +36,23 @@ const driverJourneySchema = new Schema<IDriverJourney>(
     route: { type: Schema.Types.ObjectId, ref: 'Route', required: true },
     driver: { type: Schema.Types.ObjectId, ref: 'User', required: true },
     departureIndex: { type: Number, required: true, min: 0 },
-    departureDate: { type: String, required: true, match: /^\d{4}-\d{2}-\d{2}$/ },
+    departureDate: {
+      type: String,
+      required: true,
+      validate: {
+        // The old regex accepted impossible dates ('2026-02-31'), which then
+        // never match any istDateStr() comparison and strand the row forever.
+        validator: (s: string) => {
+          if (!/^\d{4}-\d{2}-\d{2}$/.test(s)) return false;
+          const d = new Date(`${s}T00:00:00Z`);
+          return !isNaN(d.getTime()) && d.toISOString().slice(0, 10) === s;
+        },
+        message: 'departureDate must be a real calendar date (YYYY-MM-DD)',
+      },
+    },
     status: {
       type: String,
-      enum: ['scheduled', 'active', 'in_progress', 'completed', 'cancelled'],
+      enum: ['scheduled', 'active', 'in_progress', 'completed', 'cancelled', 'expired'],
       default: 'scheduled',
       index: true,
     },

@@ -52,6 +52,20 @@ export interface IRouteSchedule {
   seatPrice: number;
   vehicleType?: string; // e.g. 'shuttle', 'sedan'
   totalSeats?: number;
+  // ── Admin-configurable timing rules. All optional: absent means "use the
+  // platform default" (see utils/scheduleTiming.ts — resolve through
+  // getScheduleTiming, never read these raw). Times are IST. ──
+  /** Customer bookings close this many minutes before departure. */
+  bookingCutoffMinutes?: number;
+  /** Customers may book at most this many days ahead (today = day 0). */
+  maxAdvanceBookingDays?: number;
+  /** Driver may start the journey this many minutes before the slot time. */
+  startWindowMinutes?: number;
+  /** Rest a driver must take after completing a trip on THIS route before
+   *  starting any next journey — set on long routes. 0 = no rest required. */
+  minRestMinutes?: number;
+  /** Free cancellation closes this many minutes before departure. */
+  cancellationCutoffMinutes?: number;
 }
 
 export interface IRouteDriverRegistration {
@@ -135,12 +149,27 @@ const departureSchema = new Schema<IRouteDeparture>(
 
 const scheduleSchema = new Schema<IRouteSchedule>(
   {
-    daysOfWeek: { type: [Number], default: [] },
+    daysOfWeek: {
+      type: [Number],
+      default: [],
+      validate: {
+        // The interface documents 0=Sun..6=Sat; nothing enforced it, so an
+        // ISO-style 7 (or a negative) stored fine and silently never matched.
+        validator: (v: number[]) => v.every((n) => Number.isInteger(n) && n >= 0 && n <= 6),
+        message: 'daysOfWeek values must be integers 0 (Sunday) through 6 (Saturday)',
+      },
+    },
     departures: { type: [departureSchema], default: [] },
     returnDepartures: { type: [departureSchema], default: undefined },
     seatPrice: { type: Number, default: 0, min: 0 },
     vehicleType: { type: String, trim: true },
     totalSeats: { type: Number, min: 1 },
+    // Timing knobs — optional; defaults resolved in utils/scheduleTiming.ts.
+    bookingCutoffMinutes: { type: Number, min: 0, max: 720 },
+    maxAdvanceBookingDays: { type: Number, min: 1, max: 60 },
+    startWindowMinutes: { type: Number, min: 5, max: 720 },
+    minRestMinutes: { type: Number, min: 0, max: 1440 },
+    cancellationCutoffMinutes: { type: Number, min: 0, max: 1440 },
   },
   { _id: false }
 );

@@ -15,7 +15,10 @@ const razorpay = new Razorpay({
 
 // GST applied to wallet recharges. Keep in sync with the customer app's
 // WalletTopUpScreen so the displayed breakdown matches what's charged.
-const WALLET_GST_RATE = 0.18;
+// GST removed from wallet recharges (client decision 2026-07-30). Rate kept
+// as a constant so the quote shape (and any old clients reading `gst`) stays
+// intact — it now always computes 0.
+const WALLET_GST_RATE = 0;
 
 /**
  * Collect cancellation fees that couldn't be debited at cancel time.

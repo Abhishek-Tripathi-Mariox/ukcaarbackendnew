@@ -6,7 +6,16 @@ import {
   isUnapprovedDriver,
 } from '../middleware/driverApproval';
 import { distanceMeters } from '../utils/routeCorridor';
-import { istDateStr, istDateStrPlusDays, istMinutesOfDay } from '../utils/date';
+import {
+  istDateStr,
+  istDateStrPlusDays,
+  istMinutesOfDay,
+  istWeekday,
+  isValidCalendarDate,
+  departureEpochMs,
+  minutesUntilDeparture,
+} from '../utils/date';
+import { getScheduleTiming } from '../utils/scheduleTiming';
 import { emitToUser } from '../socket';
 
 /**
@@ -224,21 +233,40 @@ export const listScheduledRoutes = async (
     // the earliest departure time that's still in the future today; if
     // none, pick the earliest departure tomorrow.
     const todayStr = istDateStr();
-    const tomorrowStr = istDateStrPlusDays(1);
     const nowMin = istMinutesOfDay();
     const nextDepartureFor = (
       r: any,
     ): { date: string; index: number } | null => {
       const departures: { time: string }[] = r.schedule?.departures ?? [];
       if (departures.length === 0) return null;
+      // Empty daysOfWeek = the route runs every day.
+      const days: number[] = r.schedule?.daysOfWeek ?? [];
+      const operatesOn = (dateStr: string): boolean => {
+        if (days.length === 0) return true;
+        const ms = departureEpochMs(dateStr, '12:00');
+        return !isNaN(ms) && days.includes(istWeekday(new Date(ms)));
+      };
       const indexed = departures.map((d, i) => ({ ...d, originalIndex: i }));
       const sorted = [...indexed].sort((a, b) => a.time.localeCompare(b.time));
-      const upcoming = sorted.find((d) => {
-        const [h, m] = d.time.split(':').map(Number);
-        return h * 60 + m > nowMin;
-      });
-      if (upcoming) return { date: todayStr, index: upcoming.originalIndex };
-      return { date: tomorrowStr, index: sorted[0].originalIndex };
+      // Today only counts when the route actually operates today AND a slot
+      // is still ahead of the current IST time.
+      if (operatesOn(todayStr)) {
+        const upcoming = sorted.find((d) => {
+          const [h, m] = d.time.split(':').map(Number);
+          return h * 60 + m > nowMin;
+        });
+        if (upcoming) return { date: todayStr, index: upcoming.originalIndex };
+      }
+      // Roll forward to the next OPERATING day. Previously this blindly said
+      // "tomorrow", so a weekday-only route advertised a Sunday departure.
+      // A daysOfWeek route always operates at least once in any 7-day span.
+      for (let offset = 1; offset <= 7; offset++) {
+        const candidate = istDateStrPlusDays(offset);
+        if (operatesOn(candidate)) {
+          return { date: candidate, index: sorted[0].originalIndex };
+        }
+      }
+      return null;
     };
 
     // Build the (route, date, index) tuples we need booked-seat counts
@@ -559,6 +587,35 @@ export const getMyRouteRegistration = async (
 };
 
 /**
+ * Why a requested trip date can't be booked at all, independent of the slot:
+ * the date already passed, it's beyond the route's advance-booking window, or
+ * the route doesn't operate on that weekday. Returns a clean customer-facing
+ * message, or null when the date itself is fine. Callers layer the per-slot
+ * cutoff check on top (it needs the slot's departure time).
+ */
+const tripDateIssue = (
+  schedule: { daysOfWeek?: number[] } | null | undefined,
+  dateStr: string,
+  maxAdvanceBookingDays: number,
+): string | null => {
+  if (dateStr < istDateStr()) {
+    return 'This departure date has already passed.';
+  }
+  if (dateStr > istDateStrPlusDays(maxAdvanceBookingDays)) {
+    return `Bookings open up to ${maxAdvanceBookingDays} days in advance.`;
+  }
+  const days = schedule?.daysOfWeek ?? [];
+  if (days.length > 0) {
+    // Noon anchors the weekday safely away from any midnight edge.
+    const ms = departureEpochMs(dateStr, '12:00');
+    if (isNaN(ms) || !days.includes(istWeekday(new Date(ms)))) {
+      return 'This route does not operate on the selected day.';
+    }
+  }
+  return null;
+};
+
+/**
  * GET /api/v1/routes/:id/vehicles?date=YYYY-MM-DD&departureIndex=N
  *
  * Lists every approved driver (= vehicle) serving this trip, each with its
@@ -598,6 +655,42 @@ export const getRouteVehicles = async (
       return;
     }
     const totalSeats = route.schedule?.totalSeats ?? 0;
+
+    // Temporal gate. A past / out-of-window / non-operating date is not an
+    // error to the mobile client — it parses the normal shape — so return
+    // empty availability with a human explanation instead of failing.
+    if (!isValidCalendarDate(departureDate)) {
+      res.status(400).json({ success: false, message: 'Invalid departure date.' });
+      return;
+    }
+    const timing = getScheduleTiming(route.schedule);
+    const dateIssue = tripDateIssue(
+      route.schedule,
+      departureDate,
+      timing.maxAdvanceBookingDays,
+    );
+    if (dateIssue) {
+      res.status(200).json({
+        success: true,
+        message: dateIssue,
+        data: { totalSeats, vehicles: [] },
+      });
+      return;
+    }
+    // Per-slot cutoff: once today's slot is inside the booking cutoff there
+    // is nothing bookable to show, so don't advertise its vehicles.
+    const slotTime = route.schedule?.departures?.[departureIndex]?.time;
+    if (
+      slotTime &&
+      minutesUntilDeparture(departureDate, slotTime) < timing.bookingCutoffMinutes
+    ) {
+      res.status(200).json({
+        success: true,
+        message: 'Bookings for this departure are closed.',
+        data: { totalSeats, vehicles: [] },
+      });
+      return;
+    }
 
     const approved = (route.registeredDrivers || []).filter(
       (d: any) =>
@@ -716,6 +809,40 @@ export const getRouteSeats = async (
     }
     const totalSeats = route.schedule?.totalSeats ?? 0;
 
+    // Temporal gate — same rules as booking. The seat map for a date that
+    // can't be booked is all-empty plus a message; the client keeps parsing
+    // the normal shape either way.
+    if (!isValidCalendarDate(departureDate)) {
+      res.status(400).json({ success: false, message: 'Invalid departure date.' });
+      return;
+    }
+    const timing = getScheduleTiming(route.schedule);
+    const dateIssue = tripDateIssue(
+      route.schedule,
+      departureDate,
+      timing.maxAdvanceBookingDays,
+    );
+    if (dateIssue) {
+      res.status(200).json({
+        success: true,
+        message: dateIssue,
+        data: { totalSeats, booked: [] },
+      });
+      return;
+    }
+    const slotTime = route.schedule?.departures?.[departureIndex]?.time;
+    if (
+      slotTime &&
+      minutesUntilDeparture(departureDate, slotTime) < timing.bookingCutoffMinutes
+    ) {
+      res.status(200).json({
+        success: true,
+        message: 'Bookings for this departure are closed.',
+        data: { totalSeats, booked: [] },
+      });
+      return;
+    }
+
     // Scope booked seats to the chosen vehicle so seat #3 on driver A's
     // shuttle is independent of seat #3 on driver B's. Legacy callers that
     // omit driverId still get the (route-wide) booked set.
@@ -803,6 +930,54 @@ export const bookRouteSeats = async (
       .lean();
     if (!route || !route.isActive || route.type !== 'scheduled') {
       res.status(404).json({ success: false, message: 'Scheduled route not found' });
+      return;
+    }
+
+    // ── Temporal validation ──
+    // Nothing below may take money for a trip that can't happen: yesterday's
+    // bus, a date beyond the advance window, a weekday the route doesn't run,
+    // or a slot already inside the booking cutoff.
+    const timing = getScheduleTiming(route.schedule);
+    if (!isValidCalendarDate(departureDate)) {
+      res.status(400).json({ success: false, message: 'Invalid departure date.' });
+      return;
+    }
+    if (departureDate < istDateStr()) {
+      res.status(400).json({
+        success: false,
+        message: 'This departure date has already passed.',
+      });
+      return;
+    }
+    if (departureDate > istDateStrPlusDays(timing.maxAdvanceBookingDays)) {
+      res.status(400).json({
+        success: false,
+        message: `Bookings open up to ${timing.maxAdvanceBookingDays} days in advance.`,
+      });
+      return;
+    }
+    const operatingDays = route.schedule?.daysOfWeek ?? [];
+    if (operatingDays.length > 0) {
+      // Noon anchors the weekday safely away from any midnight edge.
+      const noonMs = departureEpochMs(departureDate, '12:00');
+      if (isNaN(noonMs) || !operatingDays.includes(istWeekday(new Date(noonMs)))) {
+        res.status(400).json({
+          success: false,
+          message: 'This route does not operate on the selected day.',
+        });
+        return;
+      }
+    }
+    const slotTime = route.schedule?.departures?.[departureIndex]?.time;
+    if (!slotTime) {
+      res.status(400).json({ success: false, message: 'Invalid departure slot.' });
+      return;
+    }
+    if (minutesUntilDeparture(departureDate, slotTime) < timing.bookingCutoffMinutes) {
+      res.status(400).json({
+        success: false,
+        message: 'Bookings for this departure are closed.',
+      });
       return;
     }
 
@@ -1015,7 +1190,7 @@ export const cancelRouteBooking = async (
     // either the raw booking id or the prefixed one.
     const cleanId = String(bookingId).replace(/^sched_/, '');
 
-    const { ScheduledBooking } = await import('../models');
+    const { ScheduledBooking, DriverJourney } = await import('../models');
     const booking = await ScheduledBooking.findById(cleanId);
     if (!booking) {
       res.status(404).json({ success: false, message: 'Booking not found' });
@@ -1030,6 +1205,78 @@ export const cancelRouteBooking = async (
       return;
     }
 
+    // ── Cancellation guards ──
+    // The only guard used to be status==='cancelled', so a rider could cancel
+    // a COMPLETED trip — or one they were sitting on — and pocket a 100%
+    // wallet refund. Everything below must pass before any money moves.
+    if (booking.status === 'completed') {
+      res.status(400).json({
+        success: false,
+        message: 'This trip is already completed and can no longer be cancelled.',
+      });
+      return;
+    }
+    if (booking.status === 'expired') {
+      res.status(400).json({ success: false, message: 'This booking has expired.' });
+      return;
+    }
+    if ((booking.boardedSeats?.length ?? 0) > 0) {
+      res.status(400).json({
+        success: false,
+        message: 'You have already boarded this trip, so it cannot be cancelled.',
+      });
+      return;
+    }
+    // Even if this rider hasn't boarded, the shuttle may already be running —
+    // no cancelling mid-trip from the sofa while the driver holds the seat.
+    if (booking.driver) {
+      const journey = await DriverJourney.findOne({
+        route: booking.route,
+        driver: booking.driver,
+        departureIndex: booking.departureIndex,
+        departureDate: booking.departureDate,
+        status: { $in: ['active', 'in_progress'] },
+      })
+        .select('_id')
+        .lean();
+      if (journey) {
+        res.status(400).json({
+          success: false,
+          message: 'This trip is already underway and cannot be cancelled.',
+        });
+        return;
+      }
+    }
+    // Cancellation cutoff — free cancellation closes N minutes before the
+    // slot departs (route-configurable, platform default 60).
+    const routeDoc = await Route.findById(booking.route).select('schedule').lean();
+    const timing = getScheduleTiming(routeDoc?.schedule);
+    const slotTime = routeDoc?.schedule?.departures?.[booking.departureIndex]?.time;
+    const minsToSlot = slotTime
+      ? minutesUntilDeparture(booking.departureDate, slotTime)
+      : NaN;
+    if (Number.isNaN(minsToSlot)) {
+      // The slot time can't be resolved (route deleted, departures list
+      // shortened, malformed data). This guard used to be skipped in that
+      // case — a free-cancel loophole around the cutoff. Fail CLOSED: the
+      // rider goes through support instead. Past-date bookings stay
+      // sweep-only territory (the expiry sweep refunds them automatically),
+      // so they get the same support message rather than a self-cancel.
+      res.status(400).json({
+        success: false,
+        message:
+          'Cancellation is unavailable for this booking. Please contact support.',
+      });
+      return;
+    }
+    if (minsToSlot < timing.cancellationCutoffMinutes) {
+      res.status(400).json({
+        success: false,
+        message: `Cancellations close ${timing.cancellationCutoffMinutes} minutes before departure.`,
+      });
+      return;
+    }
+
     // Record who cancelled and why so admin/customer history shows the same
     // "cancelled by + reason" detail that instant-Ride records carry. This is
     // a customer-initiated endpoint (ownership checked above), so the actor is
@@ -1039,25 +1286,86 @@ export const cancelRouteBooking = async (
         ? req.body.reason.trim()
         : 'Cancelled by customer';
 
-    booking.status = 'cancelled';
-    booking.cancellation = {
-      cancelledBy: 'customer',
-      reason,
-      cancelledAt: new Date(),
-    };
-    await booking.save();
+    // Atomic claim — the old fetch-guards-save flow raced: two parallel
+    // cancels both passed the guards and double-refunded, and a cancel racing
+    // the expiry sweep (or /complete) could overwrite a terminal status and
+    // refund a second time. Only the request that flips reserved→cancelled
+    // moves money; a loser re-reads and returns the right guard message.
+    const claimed = await ScheduledBooking.findOneAndUpdate(
+      {
+        _id: booking._id,
+        customer: req.user!._id,
+        status: 'reserved',
+        $or: [{ boardedSeats: { $exists: false } }, { boardedSeats: { $size: 0 } }],
+      },
+      {
+        $set: {
+          status: 'cancelled',
+          cancellation: {
+            cancelledBy: 'customer',
+            reason,
+            cancelledAt: new Date(),
+          },
+        },
+      },
+      { new: true },
+    );
+    if (!claimed) {
+      const fresh = await ScheduledBooking.findById(booking._id).lean();
+      if (!fresh) {
+        res.status(404).json({ success: false, message: 'Booking not found' });
+        return;
+      }
+      if (fresh.status === 'cancelled') {
+        res.status(200).json({
+          success: true,
+          message: 'Booking already cancelled',
+          data: { booking: fresh },
+        });
+        return;
+      }
+      if (fresh.status === 'completed') {
+        res.status(400).json({
+          success: false,
+          message: 'This trip is already completed and can no longer be cancelled.',
+        });
+        return;
+      }
+      if (fresh.status === 'expired') {
+        res.status(400).json({ success: false, message: 'This booking has expired.' });
+        return;
+      }
+      if ((fresh.boardedSeats?.length ?? 0) > 0) {
+        res.status(400).json({
+          success: false,
+          message: 'You have already boarded this trip, so it cannot be cancelled.',
+        });
+        return;
+      }
+      res.status(400).json({
+        success: false,
+        message: 'Unable to cancel this booking right now. Please try again.',
+      });
+      return;
+    }
 
     // Wallet-paid bookings are debited server-side at reservation, so the
     // cancel must give the money back. Razorpay refunds stay manual (support/
     // admin) — same as instant rides. Refund AFTER the status flip so a crash
     // can only under-refund (support-recoverable), never leave a cancelled=no
-    // + refunded=yes combination that hands out free money.
+    // + refunded=yes combination that hands out free money. Refund only the
+    // REMAINDER — an approved early drop may already have returned part of
+    // the fare, and that part must not be paid out twice.
     let walletBalanceAfter: number | undefined;
-    if (booking.paymentMethod === 'wallet' && booking.totalAmount > 0) {
+    const refund = Math.max(
+      0,
+      (claimed.totalAmount ?? 0) - (claimed.refundedAmount ?? 0),
+    );
+    if (claimed.paymentMethod === 'wallet' && refund > 0) {
       const { Wallet, Payment } = await import('../models');
       const refunded = await Wallet.findOneAndUpdate(
-        { user: booking.customer },
-        { $inc: { balance: booking.totalAmount } },
+        { user: claimed.customer },
+        { $inc: { balance: refund } },
         { new: true, upsert: true },
       );
       walletBalanceAfter = refunded.balance;
@@ -1065,16 +1373,19 @@ export const cancelRouteBooking = async (
       // to the app, but nothing ever wrote it here, so cancelled shuttle
       // bookings were refunded invisibly (the rider had no way to see the
       // money came back).
-      booking.refundedAmount = booking.totalAmount;
-      await booking.save();
+      await ScheduledBooking.updateOne(
+        { _id: claimed._id },
+        { $set: { refundedAmount: claimed.totalAmount ?? 0 } },
+      );
+      claimed.refundedAmount = claimed.totalAmount ?? 0;
       try {
         await Payment.create({
-          user: booking.customer,
+          user: claimed.customer,
           type: 'refund',
-          amount: booking.totalAmount,
+          amount: refund,
           method: 'wallet',
           status: 'completed',
-          description: `Refund: cancelled scheduled booking (${booking.seats.length} seat${booking.seats.length === 1 ? '' : 's'})`,
+          description: `Refund: cancelled scheduled booking (${claimed.seats.length} seat${claimed.seats.length === 1 ? '' : 's'})`,
         });
       } catch (payErr) {
         console.warn('cancelRouteBooking: refund statement row failed:', payErr);
@@ -1085,7 +1396,7 @@ export const cancelRouteBooking = async (
       success: true,
       message: 'Booking cancelled',
       data: {
-        booking,
+        booking: claimed,
         ...(walletBalanceAfter !== undefined && { walletBalance: walletBalanceAfter }),
       },
     });
@@ -1361,6 +1672,9 @@ export const getBookingStatus = async (
     const droppingStop = stopBySeq(booking.droppingStopSequence) ?? stops[stops.length - 1];
     const departureTime =
       routeDoc?.schedule?.departures?.[booking.departureIndex]?.time ?? '';
+    // Resolved timing knobs (route override or platform default) so the
+    // customer app reads the real cutoffs instead of hardcoding defaults.
+    const timing = getScheduleTiming(routeDoc?.schedule);
 
     // Minutes until the IST departure instant (departureDate + time are IST).
     let minutesToDeparture: number | null = null;
@@ -1437,6 +1751,10 @@ export const getBookingStatus = async (
         departureDate: booking.departureDate,
         departureTime,
         minutesToDeparture,
+        timing: {
+          bookingCutoffMinutes: timing.bookingCutoffMinutes,
+          cancellationCutoffMinutes: timing.cancellationCutoffMinutes,
+        },
         seats: booking.seats ?? [],
         journeyStatus,
         journeyActive,

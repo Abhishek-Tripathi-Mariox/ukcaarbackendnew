@@ -2,6 +2,7 @@ import { Router } from 'express';
 import {
   sendOtp,
   verifyOtp,
+  firebaseLogin,
   refreshToken,
   logout,
   getMe,
@@ -18,6 +19,7 @@ import { authenticate } from '../middleware/auth';
 import {
   sendOtpValidation,
   verifyOtpValidation,
+  firebaseLoginValidation,
   updateProfileValidation,
   driverSignupValidation,
 } from '../middleware/validators';
@@ -25,6 +27,9 @@ import {
 const router = Router();
 
 // ── Public ──
+// Firebase phone sign-in (replaces send-otp/verify-otp — those stay only
+// until both apps ship the new flow, then delete them and the OTP fields).
+router.post('/firebase-login', firebaseLoginValidation, firebaseLogin);
 router.post('/send-otp', sendOtpValidation, sendOtp);
 router.post('/verify-otp', verifyOtpValidation, verifyOtp);
 router.post('/refresh-token', refreshToken);

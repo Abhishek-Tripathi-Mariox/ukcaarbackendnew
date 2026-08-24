@@ -12,6 +12,18 @@ export const sendOtpValidation = [
     .withMessage('Invalid country code'),
 ];
 
+export const firebaseLoginValidation = [
+  body('idToken')
+    .notEmpty()
+    .withMessage('idToken is required')
+    .isString()
+    .withMessage('idToken must be a string'),
+  body('appType')
+    .optional()
+    .isIn(['customer', 'driver'])
+    .withMessage('Invalid appType'),
+];
+
 export const verifyOtpValidation = [
   body('phone').notEmpty().withMessage('Phone number is required'),
   body('otp')

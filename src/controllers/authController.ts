@@ -5,6 +5,7 @@ import { User, Wallet, Payment, AuditLog } from '../models';
 import { config } from '../config';
 import { AuthRequest } from '../middleware/auth';
 import { resolvePermissions } from '../config/permissions';
+import admin, { isFirebaseReady } from '../config/firebase';
 
 // ── Generate tokens ──
 const generateTokens = (userId: string, role: string) => {
@@ -214,6 +215,150 @@ export const verifyOtp = async (req: Request, res: Response): Promise<void> => {
   } catch (error) {
     console.error('verifyOtp error:', error);
     res.status(500).json({ success: false, message: 'Verification failed' });
+  }
+};
+
+/**
+ * POST /api/v1/auth/firebase-login
+ *
+ * Phone sign-in via Firebase Authentication. The app runs Firebase's own
+ * phone-verification flow — Google sends the SMS through their registered
+ * sender, so no TRAI DLT registration is needed — and posts the resulting ID
+ * token here. We verify it against the ukcaar-f7639 project and mint our own
+ * JWTs.
+ *
+ * The OTP never reaches this server on this path, which is what retires
+ * send-otp/verify-otp (and with them the generated code that send-otp
+ * currently echoes back in its own response).
+ */
+export const firebaseLogin = async (req: Request, res: Response): Promise<void> => {
+  try {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      res.status(400).json({ success: false, errors: errors.array() });
+      return;
+    }
+
+    // Without the service account the SDK cannot verify anything. Fail loudly
+    // rather than falling through to a misleading 401.
+    if (!isFirebaseReady()) {
+      res.status(503).json({
+        success: false,
+        message: 'Phone sign-in is temporarily unavailable. Please try again shortly.',
+      });
+      return;
+    }
+
+    const { idToken, appType } = req.body;
+
+    // checkRevoked:true costs one extra round-trip to Google, but it means a
+    // session revoked in the Firebase console cannot be replayed here. Login
+    // is infrequent enough that the latency does not matter.
+    let decoded: admin.auth.DecodedIdToken;
+    try {
+      decoded = await admin.auth().verifyIdToken(idToken, true);
+    } catch (err: any) {
+      const expired =
+        err?.code === 'auth/id-token-expired' || err?.code === 'auth/id-token-revoked';
+      res.status(401).json({
+        success: false,
+        message: expired
+          ? 'Your sign-in expired. Please request a new code.'
+          : 'Verification failed. Please try signing in again.',
+      });
+      return;
+    }
+
+    // Only phone sign-ins may mint a session here. Without this, an ID token
+    // from any other provider enabled on the same Firebase project would be
+    // accepted as a login.
+    if (decoded.firebase?.sign_in_provider !== 'phone' || !decoded.phone_number) {
+      res.status(400).json({ success: false, message: 'This sign-in method is not supported.' });
+      return;
+    }
+
+    // Firebase returns E.164 (+919876543210) — the same shape the OTP path
+    // built from countryCode + phone, so existing accounts match as-is.
+    const fullPhone = decoded.phone_number;
+
+    let user = await User.findOne({ phone: fullPhone });
+
+    // App-scoped role guard, identical to the OTP path: a driver/admin
+    // account must not be able to sign into the customer app.
+    if (user && appType === 'customer' && user.role !== 'customer') {
+      res.status(403).json({
+        success: false,
+        message: 'This number is registered as a driver. Please use the UKCAAR Driver app to sign in.',
+      });
+      return;
+    }
+
+    // Suspended accounts must not receive tokens. Timed suspensions lift
+    // themselves once the window passes (see sendOtp).
+    if (user && !user.isActive) {
+      if (user.suspendedUntil && user.suspendedUntil <= new Date()) {
+        user.isActive = true;
+        user.suspendedUntil = undefined;
+        (user as any).disabledAt = undefined;
+        (user as any).disabledReason = undefined;
+      } else {
+        res.status(403).json({
+          success: false,
+          message: 'Your account has been suspended. Please contact support.',
+        });
+        return;
+      }
+    }
+
+    if (!user) {
+      user = new User({
+        phone: fullPhone,
+        // The project's SMS region policy is locked to IN, so a verified
+        // phone_number reaching this point is always +91.
+        countryCode: '+91',
+        isProfileSetup: false,
+      });
+    }
+
+    user.isVerified = true;
+    // Retire any OTP left over from the old flow so it cannot be replayed
+    // against verify-otp while that endpoint still exists.
+    user.otp = undefined;
+    user.otpExpiry = undefined;
+
+    const tokens = generateTokens(user._id.toString(), user.role);
+    user.refreshToken = tokens.refreshToken;
+    await user.save();
+
+    // Ensure wallet exists (mirrors verifyOtp).
+    await Wallet.findOneAndUpdate(
+      { user: user._id },
+      { $setOnInsert: { user: user._id, balance: 0, currency: 'INR' } },
+      { upsert: true, new: true }
+    );
+
+    res.status(200).json({
+      success: true,
+      message: 'Signed in successfully',
+      data: {
+        user: {
+          id: user._id,
+          firstName: user.firstName,
+          lastName: user.lastName,
+          phone: user.phone,
+          email: user.email,
+          role: user.role,
+          isVerified: user.isVerified,
+          avatar: user.avatar,
+          isProfileSetup: !!(user as any).isProfileSetup,
+          registrationStep: user.driverProfile?.registrationStep ?? null,
+        },
+        tokens,
+      },
+    });
+  } catch (error) {
+    console.error('firebaseLogin error:', error);
+    res.status(500).json({ success: false, message: 'Sign-in failed' });
   }
 };
 

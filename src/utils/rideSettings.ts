@@ -12,6 +12,9 @@ export interface RideSettings {
   onePassCommissionRate: number;
   cancellationFee: number;
   minFare: number;
+  /** Driver-discovery radius in km — dispatch, ride-type list and socket
+   *  broadcast all read this one value. */
+  searchRadiusKm: number;
 }
 
 let cache: { value: RideSettings; at: number } | null = null;
@@ -28,6 +31,10 @@ export async function getRideSettings(force = false): Promise<RideSettings> {
     ),
     cancellationFee: numOr(doc?.cancellationFee, config.ride.cancellationFee),
     minFare: numOr(doc?.minFare, config.ride.minFare),
+    // Sourced from the admin Settings → General "Max Search Radius" field,
+    // which already existed in the model, the save endpoint and the admin UI
+    // but was read by nothing — an admin could change it and see no effect.
+    searchRadiusKm: numOr(doc?.maxSearchRadius, config.ride.searchRadiusKm),
   };
   cache = { value, at: Date.now() };
   return value;

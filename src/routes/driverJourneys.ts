@@ -26,6 +26,12 @@ import {
 import { getScheduleTiming } from '../utils/scheduleTiming';
 
 const router = Router();
+
+/**
+ * How many calendar days of upcoming scheduled journeys a driver can see,
+ * counting today as day one. 2 = today + tomorrow (client request).
+ */
+const SCHEDULE_VISIBILITY_DAYS = 2;
 router.use(authenticate);
 router.use(authorize('driver'));
 
@@ -582,9 +588,11 @@ router.get('/', async (req: AuthRequest, res: Response) => {
     for (const r of routesToCheck) {
       const departures = r.schedule?.departures || [];
       const daysOfWeek = r.schedule?.daysOfWeek || [0, 1, 2, 3, 4, 5, 6];
-      // Drivers only see the next 2 days of scheduled journeys (client
-      // request) — further dates stay hidden until they roll into the window.
-      for (let dayOffset = 0; dayOffset <= 2; dayOffset++) {
+      // Drivers see a two-day window only: today and tomorrow (client
+      // request). Further dates stay hidden until they roll into the window.
+      // `< SCHEDULE_VISIBILITY_DAYS`, not `<=` — the old `<= 2` showed three
+      // calendar days (today + 2), one more than the client asked for.
+      for (let dayOffset = 0; dayOffset < SCHEDULE_VISIBILITY_DAYS; dayOffset++) {
         const instant = new Date(now.getTime() + dayOffset * 24 * 60 * 60 * 1000);
         // IST weekday + IST date — the route's daysOfWeek and the booking dates
         // are both IST-calendar values. Using server-local getDay()/UTC

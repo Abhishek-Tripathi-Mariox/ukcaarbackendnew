@@ -341,7 +341,10 @@ async function dispatchToNearbyDrivers(ride: any): Promise<void> {
     ).map(r => String(r.driver)),
   );
 
-  const RADIUS_KM = 7;
+  // Admin-configurable (Settings → General → Max Search Radius); resolved
+  // through getRideSettings so dispatch, the customer's ride-type list and
+  // the socket broadcast can never drift apart again.
+  const RADIUS_KM = (await getRideSettings()).searchRadiusKm;
   const KM_PER_DEG_LAT = 111;
   const kmPerDegLng =
     111 * Math.cos((pickup.lat * Math.PI) / 180) || 111;
@@ -1733,7 +1736,7 @@ export const getAvailableRides = async (req: AuthRequest, res: Response): Promis
       .limit(50);
 
     const { VehicleType } = await import('../models');
-    const RADIUS_KM = 7;
+    const RADIUS_KM = (await getRideSettings()).searchRadiusKm;
     const KM_PER_DEG_LAT = 111;
     const kmPerDegLng = 111 * Math.cos((loc.lat * Math.PI) / 180) || 111;
 

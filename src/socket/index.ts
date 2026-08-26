@@ -7,6 +7,7 @@ import { User } from '../models';
 import { APPROVED_DRIVER_QUERY } from '../middleware/driverApproval';
 import config from '../config';
 import { redisSocketOptions } from '../config/redis';
+import { getRideSettings } from '../utils/rideSettings';
 
 interface AuthenticatedSocket extends Socket {
   userId?: string;
@@ -420,8 +421,16 @@ export const emitToOnlineDrivers = (event: string, data: any) => {
 /**
  * Notify nearby drivers about a new ride request
  */
-export const notifyNearbyDrivers = async (rideId: string, pickup: { lat: number; lng: number }, radiusKm: number = 5) => {
+export const notifyNearbyDrivers = async (
+  rideId: string,
+  pickup: { lat: number; lng: number },
+  radiusKm?: number,
+) => {
   try {
+    // Omit radiusKm to inherit the admin-configured dispatch radius. The old
+    // hardcoded 5 disagreed with dispatch's 7, so wiring this emitter up
+    // would have silently alerted a narrower ring than dispatch considers.
+    const radius = radiusKm ?? (await getRideSettings()).searchRadiusKm;
     const nearbyDrivers = await User.find({
       // Second emitter of 'ride:new-request' (currently unused — the live
       // fan-out is rideController.dispatchToNearbyDrivers). Carries the same
@@ -432,7 +441,7 @@ export const notifyNearbyDrivers = async (rideId: string, pickup: { lat: number;
       'driverProfile.currentLocation': {
         $nearSphere: {
           $geometry: { type: 'Point', coordinates: [pickup.lng, pickup.lat] },
-          $maxDistance: radiusKm * 1000,
+          $maxDistance: radius * 1000,
         },
       },
     }).select('_id');

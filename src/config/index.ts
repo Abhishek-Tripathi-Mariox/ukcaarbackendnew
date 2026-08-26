@@ -77,7 +77,13 @@ export const config = {
 
   // ── Ride configuration ──
   ride: {
-    searchRadiusKm: 5,
+    // Default driver-discovery radius. This is the single source of truth:
+    // dispatch, the customer's ride-type list and the socket broadcast all
+    // resolve it through getRideSettings(), which lets an admin override it.
+    // It used to be declared here at 5 and read by nothing, while dispatch
+    // hardcoded 7 and the socket broadcast hardcoded 5 — so drivers 5-7km
+    // out were dispatch-eligible but never alerted.
+    searchRadiusKm: 7,
     maxWaitTimeSec: 30,
     cancellationFee: 5.0,
     minFare: 5.0,

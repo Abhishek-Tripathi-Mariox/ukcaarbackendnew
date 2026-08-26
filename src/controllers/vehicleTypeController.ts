@@ -1,13 +1,7 @@
 import { Request, Response } from 'express';
 import { VehicleType, FuelType, User } from '../models';
 import { AuthRequest } from '../middleware/auth';
-
-/**
- * Dispatch radius for ride-type discovery — kept in sync with the same
- * radius used by `dispatchToNearbyDrivers` so what the customer sees on
- * the booking screen matches who actually receives the request.
- */
-const NEARBY_RADIUS_KM = 7;
+import { getRideSettings } from '../utils/rideSettings';
 
 /**
  * Slugifies a string to produce a stable code from a display name.
@@ -71,6 +65,10 @@ export const listNearbyVehicleTypes = async (
         .json({ success: false, message: 'lat and lng query params are required' });
       return;
     }
+
+    // Same radius dispatch uses, so what the customer sees on the booking
+    // screen matches who actually receives the request.
+    const NEARBY_RADIUS_KM = (await getRideSettings()).searchRadiusKm;
 
     // 1. Find online drivers and post-filter by distance.
     //

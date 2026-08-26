@@ -4035,7 +4035,10 @@ const GENERAL_SETTINGS_DEFAULTS = {
   appName: 'UKCAAR',
   supportEmail: 'support@ukcaar.com',
   supportPhone: '+44 800 123 4567',
-  maxSearchRadius: 10, // km
+  // Must match config.ride.searchRadiusKm — this field now actually drives
+  // dispatch, so a mismatched form default would silently widen the radius
+  // the first time an admin pressed Save on the General tab.
+  maxSearchRadius: 7, // km
   driverTimeout: 30, // seconds
   maintenanceMode: false,
   referralBonus: 0, // ₹ credited to the JOINER who applies a referral code

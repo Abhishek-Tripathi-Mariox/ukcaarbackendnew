@@ -487,6 +487,68 @@ export const registerDriverForRoute = async (
       }
     }
 
+    // Re-applying for the slot the driver already holds is a no-op request
+    // that used to be accepted — and worse, the filter below then demoted an
+    // APPROVED registration back to `pending`, so a driver who tapped
+    // "Apply for Route Change" and picked their own current route silently
+    // lost their assignment until an admin re-approved them.
+    const mine = (route.registeredDrivers || []).find(
+      d => String(d.driver) === String(driverId),
+    );
+    if (
+      mine &&
+      (mine.status === 'approved' || mine.status === 'pending') &&
+      mine.departureIndex === resolvedIndex &&
+      !!(mine as any).roundTrip === !!roundTrip
+    ) {
+      res.status(400).json({
+        success: false,
+        message:
+          mine.status === 'approved'
+            ? 'You are already assigned to this route and departure. Pick a different route or departure time to request a change.'
+            : 'You already have a pending request for this route and departure.',
+      });
+      return;
+    }
+
+    // Leaving another route strands anyone already booked onto the journeys
+    // this driver is committed to, so block the switch while those exist and
+    // let ops reassign first. Same-route slot changes are unaffected.
+    const { ScheduledBooking } = await import('../models');
+    const otherRouteIds = (
+      await Route.find({
+        _id: { $ne: route._id },
+        type: 'scheduled',
+        'registeredDrivers.driver': driverId,
+      }).select('_id')
+    ).map(r => r._id);
+
+    if (otherRouteIds.length > 0) {
+      const today = istDateStr(new Date());
+      const committed = await ScheduledBooking.countDocuments({
+        driver: driverId,
+        route: { $in: otherRouteIds },
+        status: 'reserved',
+        departureDate: { $gte: today },
+      });
+      if (committed > 0) {
+        res.status(409).json({
+          success: false,
+          message: `You have ${committed} upcoming booking${
+            committed === 1 ? '' : 's'
+          } on your current route. Those journeys must be completed or reassigned by an admin before you can change route.`,
+        });
+        return;
+      }
+      // Clear the old route(s): registrations were only ever de-duplicated
+      // within the route being applied for, so a driver who switched routes
+      // stayed registered on both and kept seeing the old route's journeys.
+      await Route.updateMany(
+        { _id: { $in: otherRouteIds } },
+        { $pull: { registeredDrivers: { driver: driverId } } },
+      );
+    }
+
     // Drop any existing registration for this driver on this route — we
     // only allow one active row. Status transitions (re-applying after
     // rejection, switching slots) all go through this same code path.

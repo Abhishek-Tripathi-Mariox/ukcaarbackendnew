@@ -137,11 +137,18 @@ export const config = {
     issuerPan: process.env.INVOICE_ISSUER_PAN || '',
     issuerAddress: process.env.INVOICE_ISSUER_ADDRESS || '',
     issuerState: process.env.INVOICE_ISSUER_STATE || 'KA',
-    // GST on cab booking service is generally 5% (without ITC) — split for intra-state
-    gstRate: parseFloat(process.env.INVOICE_GST_RATE || '0.05'),
-    cgstRate: parseFloat(process.env.INVOICE_CGST_RATE || '0.025'),
-    sgstRate: parseFloat(process.env.INVOICE_SGST_RATE || '0.025'),
-    igstRate: parseFloat(process.env.INVOICE_IGST_RATE || '0.05'),
+    // GST switched off for launch (client decision) — invoices show the full
+    // amount as taxable value with a zero tax line, and fares are unaffected
+    // either way because GST was only ever *extracted* from an inclusive fare
+    // for the invoice document, never added to what the customer paid.
+    //
+    // To switch it back on, set INVOICE_GST_RATE=0.05 with
+    // INVOICE_CGST_RATE=0.025 / INVOICE_SGST_RATE=0.025 / INVOICE_IGST_RATE=0.05
+    // (cab booking service is 5% without ITC, split for intra-state).
+    gstRate: parseFloat(process.env.INVOICE_GST_RATE || '0'),
+    cgstRate: parseFloat(process.env.INVOICE_CGST_RATE || '0'),
+    sgstRate: parseFloat(process.env.INVOICE_SGST_RATE || '0'),
+    igstRate: parseFloat(process.env.INVOICE_IGST_RATE || '0'),
     rideHsn: process.env.INVOICE_RIDE_HSN || '996412',
     // Section 194O — 1% TDS by ECO on payments to driver-partners (gross)
     tdsSection: process.env.TDS_SECTION || '194O',

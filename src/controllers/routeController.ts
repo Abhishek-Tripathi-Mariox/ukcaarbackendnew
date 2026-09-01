@@ -511,43 +511,13 @@ export const registerDriverForRoute = async (
       return;
     }
 
-    // Leaving another route strands anyone already booked onto the journeys
-    // this driver is committed to, so block the switch while those exist and
-    // let ops reassign first. Same-route slot changes are unaffected.
-    const { ScheduledBooking } = await import('../models');
-    const otherRouteIds = (
-      await Route.find({
-        _id: { $ne: route._id },
-        type: 'scheduled',
-        'registeredDrivers.driver': driverId,
-      }).select('_id')
-    ).map(r => r._id);
-
-    if (otherRouteIds.length > 0) {
-      const today = istDateStr(new Date());
-      const committed = await ScheduledBooking.countDocuments({
-        driver: driverId,
-        route: { $in: otherRouteIds },
-        status: 'reserved',
-        departureDate: { $gte: today },
-      });
-      if (committed > 0) {
-        res.status(409).json({
-          success: false,
-          message: `You have ${committed} upcoming booking${
-            committed === 1 ? '' : 's'
-          } on your current route. Those journeys must be completed or reassigned by an admin before you can change route.`,
-        });
-        return;
-      }
-      // Clear the old route(s): registrations were only ever de-duplicated
-      // within the route being applied for, so a driver who switched routes
-      // stayed registered on both and kept seeing the old route's journeys.
-      await Route.updateMany(
-        { _id: { $in: otherRouteIds } },
-        { $pull: { registeredDrivers: { driver: driverId } } },
-      );
-    }
+    // A change request must NOT touch the current route here: the driver
+    // keeps serving it (and its journeys keep generating) until an admin
+    // APPROVES the new registration — that approval is where the atomic
+    // switch happens (see PATCH /admin/routes/:id/drivers/:driverId). An
+    // earlier version pulled the old registration at apply time, which left
+    // the driver serving no route while the request sat pending, and no
+    // route at all if it was rejected.
 
     // Drop any existing registration for this driver on this route — we
     // only allow one active row. Status transitions (re-applying after
@@ -599,8 +569,11 @@ export const getMyRouteRegistration = async (
 ): Promise<void> => {
   try {
     const driverId = req.user!._id;
-    // Find any route where this driver has a non-removed registration.
-    const route = await Route.findOne({
+    // A driver can now legitimately hold TWO registrations at once: the
+    // approved route they are serving, plus a pending change request that an
+    // admin has yet to act on (the switch happens at approval). Return both
+    // so the route-change screen can show "current" and "requested".
+    const routes = await Route.find({
       type: 'scheduled',
       isActive: true,
       registeredDrivers: {
@@ -613,31 +586,40 @@ export const getMyRouteRegistration = async (
       .select('name description stops schedule registeredDrivers')
       .lean();
 
-    if (!route) {
-      res.status(200).json({ success: true, data: { registration: null } });
-      return;
-    }
+    const shape = (route: any, reg: any) => ({
+      route: {
+        _id: route._id,
+        name: route.name,
+        description: route.description,
+        stops: route.stops,
+        schedule: route.schedule,
+      },
+      status: reg?.status,
+      departureIndex: reg?.departureIndex,
+      roundTrip: reg?.roundTrip,
+      registeredAt: reg?.registeredAt,
+    });
 
-    const reg = (route.registeredDrivers || []).find(
-      (d: any) => String(d.driver) === String(driverId),
-    );
+    let current: any = null;
+    let pendingRequest: any = null;
+    for (const route of routes) {
+      const reg = (route.registeredDrivers || []).find(
+        (d: any) =>
+          String(d.driver) === String(driverId) &&
+          ['pending', 'approved'].includes(d.status),
+      );
+      if (!reg) continue;
+      if (reg.status === 'approved' && !current) current = shape(route, reg);
+      else if (reg.status === 'pending' && !pendingRequest) pendingRequest = shape(route, reg);
+    }
 
     res.status(200).json({
       success: true,
       data: {
-        registration: {
-          route: {
-            _id: route._id,
-            name: route.name,
-            description: route.description,
-            stops: route.stops,
-            schedule: route.schedule,
-          },
-          status: reg?.status,
-          departureIndex: reg?.departureIndex,
-          roundTrip: reg?.roundTrip,
-          registeredAt: reg?.registeredAt,
-        },
+        current,
+        pendingRequest,
+        // Back-compat: older callers read a single `registration`.
+        registration: current ?? pendingRequest,
       },
     });
   } catch (error) {

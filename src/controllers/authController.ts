@@ -219,6 +219,71 @@ export const verifyOtp = async (req: Request, res: Response): Promise<void> => {
 };
 
 /**
+ * POST /api/v1/auth/check-eligibility
+ *
+ * Pre-flight guard, called before the app asks Firebase to send a code.
+ *
+ * The OTP path used to reject a driver signing into the customer app inside
+ * send-otp, so the refusal appeared instantly and no SMS was sent. Firebase
+ * phone auth moved code delivery off this server, so without this endpoint a
+ * driver gets a real (billable) SMS, waits for it, types it in, and only then
+ * discovers they are on the wrong app.
+ *
+ * Deliberately does not mutate anything — a timed suspension is reported, not
+ * lifted; that still happens at firebase-login.
+ */
+export const checkAppEligibility = async (req: Request, res: Response): Promise<void> => {
+  try {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      res.status(400).json({ success: false, errors: errors.array() });
+      return;
+    }
+
+    const { phone, countryCode = '+91', appType } = req.body;
+    const fullPhone = `${countryCode}${String(phone).replace(/\s/g, '')}`;
+
+    const user = await User.findOne({ phone: fullPhone }).select(
+      'role isActive suspendedUntil',
+    );
+
+    // Unknown number = a new signup. Always allowed.
+    if (!user) {
+      res.status(200).json({ success: true, data: { eligible: true } });
+      return;
+    }
+
+    // Same app-scoped role guard the OTP path applied. The driver app omits
+    // appType, so this only ever fires for the customer app.
+    if (appType === 'customer' && user.role !== 'customer') {
+      res.status(403).json({
+        success: false,
+        message:
+          'This number is registered as a driver. Please use the UKCAAR Driver app to sign in.',
+      });
+      return;
+    }
+
+    const stillSuspended =
+      !user.isActive && !(user.suspendedUntil && user.suspendedUntil <= new Date());
+    if (stillSuspended) {
+      res.status(403).json({
+        success: false,
+        message: 'Your account has been suspended. Please contact support.',
+      });
+      return;
+    }
+
+    res.status(200).json({ success: true, data: { eligible: true } });
+  } catch (error) {
+    console.error('checkAppEligibility error:', error);
+    // Never block sign-in on this check failing — firebase-login still
+    // enforces both guards authoritatively.
+    res.status(200).json({ success: true, data: { eligible: true } });
+  }
+};
+
+/**
  * POST /api/v1/auth/firebase-login
  *
  * Phone sign-in via Firebase Authentication. The app runs Firebase's own

@@ -574,7 +574,17 @@ router.get('/', async (req: AuthRequest, res: Response) => {
       isActive: true,
       type: 'scheduled',
       $or: [
-        { 'registeredDrivers.driver': new mongoose.Types.ObjectId(driverId) },
+        // Approved registrations only: a PENDING change request must not
+        // start generating the new route's journeys (and a rejected one
+        // never should) — the switch happens when the admin approves.
+        {
+          registeredDrivers: {
+            $elemMatch: {
+              driver: new mongoose.Types.ObjectId(driverId),
+              status: 'approved',
+            },
+          },
+        },
         { driver: new mongoose.Types.ObjectId(driverId) },
       ],
     }).lean();

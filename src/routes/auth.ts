@@ -3,6 +3,7 @@ import {
   sendOtp,
   verifyOtp,
   firebaseLogin,
+  checkAppEligibility,
   refreshToken,
   logout,
   getMe,
@@ -20,6 +21,7 @@ import {
   sendOtpValidation,
   verifyOtpValidation,
   firebaseLoginValidation,
+  checkEligibilityValidation,
   updateProfileValidation,
   driverSignupValidation,
 } from '../middleware/validators';
@@ -29,6 +31,9 @@ const router = Router();
 // ── Public ──
 // Firebase phone sign-in (replaces send-otp/verify-otp — those stay only
 // until both apps ship the new flow, then delete them and the OTP fields).
+// Pre-flight: lets the app refuse a wrong-app/suspended number BEFORE
+// Firebase sends a billable SMS.
+router.post('/check-eligibility', checkEligibilityValidation, checkAppEligibility);
 router.post('/firebase-login', firebaseLoginValidation, firebaseLogin);
 router.post('/send-otp', sendOtpValidation, sendOtp);
 router.post('/verify-otp', verifyOtpValidation, verifyOtp);

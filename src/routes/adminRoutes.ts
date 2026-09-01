@@ -1,6 +1,7 @@
 import { Router, Request, Response } from 'express';
 import mongoose from 'mongoose';
-import { Route, User } from '../models';
+import { istDateStr } from '../utils/date';
+import { Route, User, ScheduledBooking } from '../models';
 import { requirePermission } from '../middleware/auth';
 import { auditLog } from '../middleware/audit';
 import { PERMISSIONS } from '../config/permissions';
@@ -437,6 +438,40 @@ router.patch(
       if (status === 'approved') {
         update['registeredDrivers.$.approvedAt'] = new Date();
         update['registeredDrivers.$.approvedBy'] = (req as any).user?._id;
+
+        // Approving here IS the route switch: the driver's registration on
+        // any other route is removed below, and journey generation follows
+        // approved registrations only. Refuse while the driver still has
+        // upcoming reserved bookings on those other routes — pulling the
+        // registration would strand riders who already hold seats.
+        const otherRouteIds = (
+          await Route.find({
+            _id: { $ne: id },
+            type: 'scheduled',
+            'registeredDrivers.driver': driverId,
+          }).select('_id')
+        ).map((r) => r._id);
+        if (otherRouteIds.length > 0) {
+          const committed = await ScheduledBooking.countDocuments({
+            driver: driverId,
+            route: { $in: otherRouteIds },
+            status: 'reserved',
+            departureDate: { $gte: istDateStr() },
+          });
+          if (committed > 0) {
+            res.status(409).json({
+              success: false,
+              message: `This driver still has ${committed} upcoming booking${
+                committed === 1 ? '' : 's'
+              } on their current route. Complete or reassign those journeys before approving the change.`,
+            });
+            return;
+          }
+          await Route.updateMany(
+            { _id: { $in: otherRouteIds } },
+            { $pull: { registeredDrivers: { driver: driverId } } }
+          );
+        }
       }
 
       const route = await Route.findOneAndUpdate(

@@ -12,6 +12,15 @@ export const sendOtpValidation = [
     .withMessage('Invalid country code'),
 ];
 
+export const checkEligibilityValidation = [
+  body('phone').notEmpty().withMessage('Phone number is required'),
+  body('countryCode')
+    .optional()
+    .matches(/^\+\d{1,4}$/)
+    .withMessage('Invalid country code'),
+  body('appType').optional().isIn(['customer', 'driver']).withMessage('Invalid appType'),
+];
+
 export const firebaseLoginValidation = [
   body('idToken')
     .notEmpty()

@@ -2,7 +2,7 @@ import { Router, Request, Response } from 'express';
 import mongoose from 'mongoose';
 import { APPROVED_DRIVER_QUERY, driverWorkBlockReason } from '../middleware/driverApproval';
 import { istDateStr } from '../utils/date';
-import { User, Ride, Payment, Wallet, Chat, PromoCode, Notification, SupportTicket } from '../models';
+import { User, Ride, Payment, Wallet, Chat, PromoCode, Notification, Route, SupportTicket } from '../models';
 import { sendPushToTokens } from '../config/firebase';
 import { authenticate, authorize, requirePermission } from '../middleware/auth';
 import { auditLog } from '../middleware/audit';
@@ -333,6 +333,7 @@ router.get('/alerts', async (_req: Request, res: Response) => {
       ticketCount,
       tickets,
       breachedSla,
+      routesWithPendingRegs,
     ] = await Promise.all([
       User.countDocuments(pendingAppFilter),
       User.find(pendingAppFilter)
@@ -362,6 +363,14 @@ router.get('/alerts', async (_req: Request, res: Response) => {
         slaDueAt: { $lt: now },
         status: { $nin: ['resolved', 'closed'] },
       }),
+      // Routes holding a pending driver registration — new signups and route
+      // CHANGE requests both land here, and the only place they used to show
+      // was inside the specific route's Drivers panel, which nothing pointed
+      // the admin at.
+      Route.find({ 'registeredDrivers.status': 'pending' })
+        .select('name registeredDrivers')
+        .populate('registeredDrivers.driver', 'firstName lastName phone')
+        .lean(),
     ]);
 
     const pendingAppItems = pendingApps.map((u: any) => ({
@@ -410,6 +419,25 @@ router.get('/alerts', async (_req: Request, res: Response) => {
       at: t.createdAt,
     }));
 
+    // One row per pending registration (a driver can hold one on their new
+    // route while still serving their current one — the change model).
+    const routeRegItems: any[] = [];
+    let routeRegCount = 0;
+    for (const r of routesWithPendingRegs as any[]) {
+      for (const d of (r.registeredDrivers ?? []).filter((x: any) => x.status === 'pending')) {
+        routeRegCount += 1;
+        if (routeRegItems.length < RECENT) {
+          const drv: any = d.driver ?? {};
+          routeRegItems.push({
+            id: `${r._id}:${drv._id ?? ''}`,
+            label: `${drv.firstName ?? ''} ${drv.lastName ?? ''}`.trim() || 'Driver',
+            sublabel: `wants ${r.name}`,
+            at: d.registeredAt,
+          });
+        }
+      }
+    }
+
     const groups = [
       {
         key: 'pendingApplications',
@@ -431,6 +459,13 @@ router.get('/alerts', async (_req: Request, res: Response) => {
         count: disputeCount,
         target: '/rides?tab=disputes',
         items: disputeItems,
+      },
+      {
+        key: 'routeRegistrations',
+        title: 'Route registrations & change requests',
+        count: routeRegCount,
+        target: '/routes',
+        items: routeRegItems,
       },
       {
         key: 'openTickets',
@@ -990,6 +1025,40 @@ router.get('/referrals/:userId', requirePermission(PERMISSIONS.VIEW_REFERRALS), 
 // ════════════════════════════════════════════════════════════════════
 
 /**
+ * Attach each scheduled-service driver's shuttle-route registration
+ * (approved, else the pending request) as `routeRegistration`, so admins see
+ * the route a driver asked for right on the application instead of hunting
+ * for it under Routes. One query per page of drivers.
+ */
+async function attachRouteRegistrations(drivers: any[]): Promise<void> {
+  const ids = drivers
+    .filter((d) => d?.driverProfile?.serviceType === 'scheduled')
+    .map((d) => d._id);
+  if (ids.length === 0) return;
+  const routes = await Route.find({
+    type: 'scheduled',
+    'registeredDrivers.driver': { $in: ids },
+  })
+    .select('name registeredDrivers.driver registeredDrivers.status')
+    .lean();
+  const rank = (status: string) => (status === 'approved' ? 2 : status === 'pending' ? 1 : 0);
+  const byDriver = new Map<string, { routeId: string; routeName: string; status: string }>();
+  for (const r of routes as any[]) {
+    for (const reg of r.registeredDrivers ?? []) {
+      const key = String(reg.driver);
+      const current = byDriver.get(key);
+      if (!current || rank(reg.status) > rank(current.status)) {
+        byDriver.set(key, { routeId: String(r._id), routeName: r.name, status: reg.status });
+      }
+    }
+  }
+  for (const d of drivers) {
+    const reg = byDriver.get(String(d._id));
+    if (reg) d.routeRegistration = reg;
+  }
+}
+
+/**
  * GET /api/v1/admin/drivers
  * List all drivers with filters
  */
@@ -1047,6 +1116,7 @@ router.get('/drivers', async (req: Request, res: Response) => {
       obj.isVerified = obj.driverProfile?.registrationStep === 'approved';
       return obj;
     });
+    await attachRouteRegistrations(projected);
 
     res.status(200).json({
       success: true,
@@ -1107,6 +1177,7 @@ router.get('/drivers/applications', async (req: Request, res: Response) => {
       obj.isVerified = obj.driverProfile?.registrationStep === 'approved';
       return obj;
     });
+    await attachRouteRegistrations(projected);
 
     res.status(200).json({
       success: true,
@@ -1210,17 +1281,17 @@ router.get('/drivers/:id', async (req: Request, res: Response) => {
         .limit(10),
     ]);
 
+    // Mirror the list endpoint: derive `isVerified` from the application
+    // registration step so the admin UI sees the same approval status on the
+    // detail view as on the list view.
+    const driverObj: any = driver.toObject();
+    driverObj.isVerified = driverObj.driverProfile?.registrationStep === 'approved';
+    await attachRouteRegistrations([driverObj]);
+
     res.status(200).json({
       success: true,
       data: {
-        driver: (() => {
-          // Mirror the list endpoint: derive `isVerified` from the
-          // application registration step so the admin UI sees the same
-          // approval status on the detail view as on the list view.
-          const obj: any = driver.toObject();
-          obj.isVerified = obj.driverProfile?.registrationStep === 'approved';
-          return obj;
-        })(),
+        driver: driverObj,
         rides,
         earnings: earnings[0] || { total: 0, thisWeek: 0, thisMonth: 0 },
         recentRatings,
@@ -2877,9 +2948,17 @@ router.post('/rides/:id/complete', requirePermission(PERMISSIONS.MANAGE_RIDES), 
     const isOnePass = driverUser?.driverProfile?.isOnePass;
     const { getRideSettings } = await import('../utils/rideSettings');
     const rideSettings = await getRideSettings();
+    // Same precedence as finalizeRideSettlement: OnePass → per-driver
+    // override (percent) → platform default.
+    const drvDoc: any = ride.driver
+      ? await User.findById(ride.driver).select('driverProfile.commissionRate').lean()
+      : null;
+    const drvPct = drvDoc?.driverProfile?.commissionRate;
     const commissionRate = isOnePass
       ? rideSettings.onePassCommissionRate
-      : rideSettings.commissionRate;
+      : typeof drvPct === 'number' && Number.isFinite(drvPct)
+        ? Math.min(Math.max(drvPct, 0), 100) / 100
+        : rideSettings.commissionRate;
     ride.commission = Math.round(ride.actualFare * commissionRate * 100) / 100;
     ride.driverEarnings = Math.round(
       (ride.actualFare - ride.commission + (ride.tip || 0)) * 100,
@@ -2910,14 +2989,16 @@ router.post('/rides/:id/complete', requirePermission(PERMISSIONS.MANAGE_RIDES), 
         { $inc: { balance: ride.driverEarnings } },
         { upsert: true, new: true },
       );
+      // Gross fare row (+tip); the commission debit row below nets it to the
+      // wallet credit. See finalizeRideSettlement for why.
       await Payment.create({
         user: ride.driver,
         ride: ride._id,
         type: 'ride_payment',
-        amount: ride.driverEarnings,
+        amount: Math.round(((ride.actualFare ?? 0) + (ride.tip ?? 0)) * 100) / 100,
         method: 'wallet',
         status: 'completed',
-        description: `Ride earning - ${ride.rideType} (after ${Math.round(commissionRate * 100)}% commission)`,
+        description: `Ride fare - ${ride.rideType}`,
       });
       if (ride.commission && ride.commission > 0) {
         await Payment.create({
@@ -3906,6 +3987,7 @@ router.get('/settings/fares', async (_req: Request, res: Response) => {
       data: {
         baseFares,
         commission: settings.commissionRate,
+        onePassCommission: settings.onePassCommissionRate,
         cancellationFee: settings.cancellationFee,
         minFare: settings.minFare,
       },
@@ -3926,7 +4008,7 @@ router.get('/settings/fares', async (_req: Request, res: Response) => {
  */
 router.patch('/settings/fares', requirePermission(PERMISSIONS.MANAGE_SETTINGS), auditLog({ action: 'settings.update_fares', resourceType: 'Settings' }), async (req: Request, res: Response) => {
   try {
-    const { baseFares, commission, cancellationFee, minFare } = req.body ?? {};
+    const { baseFares, commission, onePassCommission, cancellationFee, minFare } = req.body ?? {};
     if (!baseFares || typeof baseFares !== 'object') {
       res.status(400).json({ success: false, message: 'baseFares object is required' });
       return;
@@ -3972,6 +4054,10 @@ router.patch('/settings/fares', requirePermission(PERMISSIONS.MANAGE_SETTINGS), 
     const commissionPct = num(commission);
     if (commissionPct !== undefined) {
       settingsUpdate.commissionRate = Math.min(commissionPct, 100) / 100;
+    }
+    const onePassPct = num(onePassCommission);
+    if (onePassPct !== undefined) {
+      settingsUpdate.onePassCommissionRate = Math.min(onePassPct, 100) / 100;
     }
     const cancel = num(cancellationFee);
     if (cancel !== undefined) settingsUpdate.cancellationFee = cancel;

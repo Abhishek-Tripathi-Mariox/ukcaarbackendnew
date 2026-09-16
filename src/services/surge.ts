@@ -57,6 +57,19 @@ export async function isPickupBlocked(
   return { blocked: !!blocker, zone: blocker };
 }
 
+/**
+ * Service-area geofence. Once admins have drawn at least one active
+ * 'service_area' zone, instant/private rides may only start and end inside
+ * one of them. With no such zone defined there is no restriction (the
+ * pre-existing behaviour), so the geofence is opt-in per deployment.
+ */
+export async function isOutsideServiceArea(lat: number, lng: number): Promise<boolean> {
+  const hasArea = await Zone.exists({ isActive: true, kind: 'service_area' });
+  if (!hasArea) return false;
+  const zones = await zonesContaining(lat, lng);
+  return !zones.some((z) => z.kind === 'service_area');
+}
+
 function ruleMatchesTime(rule: ISurgeRule, when: Date): boolean {
   if (rule.startDate && when < rule.startDate) return false;
   if (rule.endDate && when > rule.endDate) return false;

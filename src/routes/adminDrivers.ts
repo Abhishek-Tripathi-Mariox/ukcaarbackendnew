@@ -1,6 +1,6 @@
 import { Router, Request, Response } from 'express';
 import mongoose from 'mongoose';
-import { Notification, User, Ride, Payment } from '../models';
+import { Notification, User, Ride, Payment, Route } from '../models';
 import { authenticate, authorize, requirePermission } from '../middleware/auth';
 import { auditLog } from '../middleware/audit';
 import { PERMISSIONS } from '../config/permissions';
@@ -18,6 +18,9 @@ const REQUIRED_DRIVER_DOCS = [
   'profile-photo',
   'vehicle',
   'insurance',
+  // Collected by the driver app's Vehicle Details step since 1.0.10 (drivers
+  // on older builds add it from the Documents screen after updating).
+  'vehicle-photo',
 ] as const;
 
 /**
@@ -201,6 +204,52 @@ const approveHandler = async (req: Request, res: Response) => {
       res.status(404).json({ success: false, message: 'Driver not found' });
       return;
     }
+    // Scheduled-service drivers pick a route during registration, and that
+    // request used to need a second, separate approval under Routes. Approving
+    // the driver now approves their pending route request as well — only while
+    // they hold no approved route yet. Later route CHANGES stay in the Routes
+    // menu, where the strand guard (upcoming bookings on the old route) applies.
+    let routeApproved: { id: string; name: string } | null = null;
+    if ((driver.driverProfile as any)?.serviceType === 'scheduled') {
+      try {
+        const routes: any[] = await Route.find({
+          type: 'scheduled',
+          'registeredDrivers.driver': driver._id,
+        })
+          .select('name registeredDrivers')
+          .lean();
+        const mine = (r: any, status: string) =>
+          (r.registeredDrivers ?? []).find(
+            (d: any) => String(d.driver) === String(driver._id) && d.status === status,
+          );
+        const hasApproved = routes.some((r) => mine(r, 'approved'));
+        if (!hasApproved) {
+          const pending = routes
+            .map((r) => ({ route: r, reg: mine(r, 'pending') }))
+            .filter((x) => x.reg)
+            .sort(
+              (a, b) =>
+                new Date(a.reg.registeredAt ?? 0).getTime() -
+                new Date(b.reg.registeredAt ?? 0).getTime(),
+            )[0];
+          if (pending) {
+            await Route.updateOne(
+              { _id: pending.route._id, 'registeredDrivers.driver': driver._id },
+              {
+                $set: {
+                  'registeredDrivers.$.status': 'approved',
+                  'registeredDrivers.$.approvedAt': new Date(),
+                  'registeredDrivers.$.approvedBy': (req as any).user?._id,
+                },
+              },
+            );
+            routeApproved = { id: String(pending.route._id), name: pending.route.name };
+          }
+        }
+      } catch (err) {
+        console.warn('[approve] route auto-approve failed:', err);
+      }
+    }
     const approvedCopy = await (await import('../services/notificationTemplate')).templatedCopy(
       'application.approved',
       {},
@@ -226,7 +275,13 @@ const approveHandler = async (req: Request, res: Response) => {
       message:
         'Congratulations! Your driver application has been approved. You can now go online and accept rides.',
     });
-    res.status(200).json({ success: true, data: { driver }, message: 'Driver approved' });
+    res.status(200).json({
+      success: true,
+      data: { driver, routeApproved },
+      message: routeApproved
+        ? `Driver approved · route "${routeApproved.name}" approved too`
+        : 'Driver approved',
+    });
   } catch (error) {
     res.status(500).json({ success: false, message: 'Approval failed' });
   }

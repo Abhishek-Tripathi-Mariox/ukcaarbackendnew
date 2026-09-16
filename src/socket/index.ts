@@ -16,6 +16,13 @@ interface AuthenticatedSocket extends Socket {
 
 let io: SocketServer;
 
+// Drivers whose last socket dropped and who haven't reconnected yet. A killed
+// app never sends toggle-online(false), so the driver stayed "online" in admin
+// and in dispatch until they next opened the app. After this grace with no
+// socket for the user (and no ride in progress) we flip isOnline off.
+const OFFLINE_GRACE_MS = 60 * 1000;
+const offlineTimers = new Map<string, NodeJS.Timeout>();
+
 export const initializeSocket = (httpServer: HttpServer): SocketServer => {
   io = new SocketServer(httpServer, {
     cors: {
@@ -56,6 +63,13 @@ export const initializeSocket = (httpServer: HttpServer): SocketServer => {
     // ── Driver events ──
     if (role === 'driver') {
       socket.join('drivers:online');
+
+      // Reconnected inside the grace window — cancel the pending offline flip.
+      const pendingOffline = offlineTimers.get(userId);
+      if (pendingOffline) {
+        clearTimeout(pendingOffline);
+        offlineTimers.delete(userId);
+      }
 
       // Real-time location update.
       // The User schema stores currentLocation as a flat { lat, lng } subdoc
@@ -350,6 +364,39 @@ export const initializeSocket = (httpServer: HttpServer): SocketServer => {
       console.log(`[Socket] ${role} disconnected: ${userId}`);
       if (role === 'driver') {
         socket.leave('drivers:online');
+        const existing = offlineTimers.get(userId);
+        if (existing) clearTimeout(existing);
+        offlineTimers.set(
+          userId,
+          setTimeout(async () => {
+            offlineTimers.delete(userId);
+            try {
+              // Another live socket for this driver (second device, or a
+              // reconnect that raced this timer) means they're still here.
+              const live = await io.in(`user:${userId}`).fetchSockets();
+              if (live.length > 0) return;
+              // Never pull a driver off a ride they're on — the app may just
+              // be backgrounded with the socket asleep.
+              const { Ride } = await import('../models');
+              const busy = await Ride.exists({
+                driver: userId,
+                status: { $in: ['driver_assigned', 'driver_arriving', 'driver_arrived', 'in_progress'] },
+              });
+              if (busy) return;
+              const r = await User.updateOne(
+                { _id: userId, 'driverProfile.isOnline': true },
+                { $set: { 'driverProfile.isOnline': false } },
+              );
+              if (r.modifiedCount > 0) {
+                console.log(
+                  `[Socket] driver ${userId} marked offline after ${OFFLINE_GRACE_MS / 1000}s without a socket`,
+                );
+              }
+            } catch (err) {
+              console.warn('[Socket] offline sweep failed:', err);
+            }
+          }, OFFLINE_GRACE_MS),
+        );
       }
     });
   });

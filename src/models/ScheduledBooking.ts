@@ -35,12 +35,17 @@ export interface IScheduledBooking extends Document {
   /** Per-seat passenger details captured during booking. Persisted so the
    *  ticket / Activity history can show who each seat is for after the fact
    *  (the booking flow only had them in nav params before). */
-  passengers?: { seat: number; name: string; contact?: string }[];
+  passengers?: { seat: number; name: string; contact?: string; gender?: 'male' | 'female' | 'other' }[];
   customer: Types.ObjectId;
   /** 'expired' = the trip date passed without the journey ever running; set by
    *  the maintenance sweep, which also auto-refunds the unridden amount. */
   status: 'reserved' | 'cancelled' | 'completed' | 'expired';
   totalAmount: number;
+  /** Promo applied at booking: the code, the ₹ taken off, and the fare before
+   *  the discount. `totalAmount` is what was actually charged. */
+  promoCode?: string;
+  discount?: number;
+  grossAmount?: number;
   /** How the rider paid. 'wallet' bookings are auto-refunded to the wallet on
    *  cancel; 'razorpay' refunds are handled by support/admin out of band.
    *  Absent on legacy rows created before server-side wallet debits existed. */
@@ -140,6 +145,7 @@ const scheduledBookingSchema = new Schema<IScheduledBooking>(
           seat: { type: Number },
           name: { type: String },
           contact: { type: String },
+          gender: { type: String, enum: ['male', 'female', 'other'] },
         },
       ],
       default: [],
@@ -152,6 +158,9 @@ const scheduledBookingSchema = new Schema<IScheduledBooking>(
       index: true,
     },
     totalAmount: { type: Number, default: 0, min: 0 },
+    promoCode: { type: String, trim: true, uppercase: true },
+    discount: { type: Number, default: 0, min: 0 },
+    grossAmount: { type: Number, min: 0 },
     paymentMethod: { type: String, enum: ['wallet', 'razorpay'] },
     boardedSeats: { type: [Number], default: [] },
     noShowSeats: { type: [Number], default: [] },

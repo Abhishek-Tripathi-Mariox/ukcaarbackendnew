@@ -4,6 +4,7 @@ import { User, Ride, Payment, Route } from '../models';
 import { AuthRequest } from '../middleware/auth';
 import { driverWorkBlockReason } from '../middleware/driverApproval';
 import { config } from '../config';
+import { getRideSettings } from '../utils/rideSettings';
 import { createOrder } from './paymentController';
 
 const REGISTRATION_STEPS = [
@@ -552,7 +553,11 @@ export const getMyEarnings = async (req: AuthRequest, res: Response): Promise<vo
     const user = await User.findById(driverId).select(
       'driverProfile.commissionRate driverProfile.rating',
     );
-    const commissionPct = user?.driverProfile?.commissionRate ?? 20;
+    // Platform default is admin-configurable; a hardcoded 20 disagreed with
+    // settlement whenever the admin had changed it.
+    const commissionPct =
+      user?.driverProfile?.commissionRate ??
+      Math.round((await getRideSettings()).commissionRate * 100);
     // Raw rating (0 for a driver nobody has rated yet). The app applies the
     // display rule — show 5 until a real rating exists — so the Earnings
     // header stops rendering an em dash.

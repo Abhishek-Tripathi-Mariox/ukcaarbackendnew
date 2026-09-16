@@ -1,12 +1,14 @@
 import { Schema, model, Document, Types } from 'mongoose';
 
-export type ZoneKind = 'surge' | 'no_pickup' | 'airport' | 'city' | 'restricted';
+export type ZoneKind = 'surge' | 'no_pickup' | 'airport' | 'city' | 'restricted' | 'service_area';
 
 /**
  * A geographic zone defined as a GeoJSON Polygon (or MultiPolygon).
  * Used for:
  *  - Static surge multipliers attached to a zone
  *  - No-pickup / restricted areas (rides may not start here)
+ *  - Service area: once at least one active service_area zone exists,
+ *    instant/private rides must start AND end inside one of them
  *  - Airport / city tagging (analytics & special pricing)
  *
  * Polygon coordinates follow GeoJSON spec: [lng, lat], outer ring closed.
@@ -35,7 +37,7 @@ const zoneSchema = new Schema<IZone>(
     name: { type: String, required: true, trim: true },
     kind: {
       type: String,
-      enum: ['surge', 'no_pickup', 'airport', 'city', 'restricted'],
+      enum: ['surge', 'no_pickup', 'airport', 'city', 'restricted', 'service_area'],
       required: true,
       index: true,
     },

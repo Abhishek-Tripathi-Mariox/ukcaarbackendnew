@@ -754,6 +754,7 @@ router.get('/:key/passengers', async (req: AuthRequest, res: Response) => {
             [cust?.firstName, cust?.lastName].filter(Boolean).join(' ') ||
             'Passenger',
           contact: pax?.contact || cust?.phone || '',
+          gender: pax?.gender ?? null,
           boarded: boarded.has(seat),
           noShow: noShow.has(seat),
           // Dropped early (got off before their booked stop) — no longer on board.

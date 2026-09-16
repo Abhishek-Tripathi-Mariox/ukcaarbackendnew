@@ -10,6 +10,7 @@ import {
   checkoutPage,
   checkoutCallback,
   validatePromo,
+  getActivePromos,
   getDriverEarnings,
   getSavedMethods,
   addSavedMethod,
@@ -47,6 +48,7 @@ router.post('/create-order', createOrder);
 router.post('/verify-payment', verifyPayment);
 router.post('/cancel-order', cancelOrder);
 router.post('/promo/validate', validatePromo);
+router.get('/promo/active', getActivePromos);
 
 // Saved payment methods
 router.get('/methods', getSavedMethods);

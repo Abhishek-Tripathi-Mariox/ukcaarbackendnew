@@ -1291,6 +1291,21 @@ export const validatePromo = async (req: AuthRequest, res: Response): Promise<vo
       return;
     }
 
+    // Per-customer limit — the same rule createRide applies, so "Applied" on
+    // the booking screen never turns into a silently un-discounted ride.
+    if (promo.maxUsesPerUser && promo.maxUsesPerUser > 0) {
+      const { Ride } = await import('../models/Ride');
+      const priorUses = await Ride.countDocuments({
+        customer: req.user!._id,
+        promoCode: promo.code,
+        status: { $nin: ['cancelled'] },
+      });
+      if (priorUses >= promo.maxUsesPerUser) {
+        res.status(400).json({ success: false, message: 'You have already used this promo code' });
+        return;
+      }
+    }
+
     res.status(200).json({
       success: true,
       data: {
@@ -1299,10 +1314,36 @@ export const validatePromo = async (req: AuthRequest, res: Response): Promise<vo
         value: promo.value,
         maxDiscount: promo.maxDiscount,
         minFare: promo.minFare,
+        description: promo.description,
       },
     });
   } catch (error) {
     res.status(500).json({ success: false, message: 'Promo validation failed' });
+  }
+};
+
+/**
+ * GET /api/v1/payments/promo/active
+ * Promo codes a rider can use right now — surfaced on the customer Home
+ * "Offers" rail and the promo field on SelectRide. Same eligibility as
+ * validatePromo (active, unexpired, global uses left); the per-customer
+ * limit is checked when the rider applies the code / books.
+ */
+export const getActivePromos = async (_req: AuthRequest, res: Response): Promise<void> => {
+  try {
+    const { PromoCode } = await import('../models/Chat');
+    const promos = await PromoCode.find({
+      isActive: true,
+      expiresAt: { $gt: new Date() },
+      $expr: { $lt: ['$usedCount', '$maxUses'] },
+    })
+      .sort({ expiresAt: 1 })
+      .limit(20)
+      .select('code type value description minFare maxDiscount expiresAt')
+      .lean();
+    res.status(200).json({ success: true, data: { promos } });
+  } catch (error) {
+    res.status(500).json({ success: false, message: 'Failed to fetch promos' });
   }
 };
 

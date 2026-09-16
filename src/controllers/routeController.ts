@@ -942,7 +942,7 @@ export const bookRouteSeats = async (
     const { id } = req.params;
     const {
       departureDate, departureIndex, seats, totalAmount, driverId, passengers,
-      paymentMethod, boardingStopSequence, droppingStopSequence,
+      paymentMethod, boardingStopSequence, droppingStopSequence, promoCode,
     } = req.body ?? {};
 
     if (!driverId || typeof driverId !== 'string') {
@@ -1102,6 +1102,7 @@ export const bookRouteSeats = async (
             seat: Number(p?.seat) || 0,
             name: String(p?.name ?? '').trim(),
             contact: p?.contact ? String(p.contact).trim() : undefined,
+            gender: ['male', 'female', 'other'].includes(p?.gender) ? p.gender : undefined,
           }))
           .filter((p: any) => p.name)
       : [];
@@ -1114,7 +1115,64 @@ export const bookRouteSeats = async (
     // ~₹1000). Exact server-side segment pricing (to also enforce a FLOOR
     // against a tampered client under-paying) needs the boarding/dropping stop
     // indices persisted — that's a tracked follow-up.
-    const amount = Number(totalAmount) || 0;
+    const grossAmount = Number(totalAmount) || 0;
+
+    // ── Promo code (optional) ──
+    // Same rules as instant rides (requestRide): active, unexpired, global
+    // uses left, per-customer limit counted across rides AND seat bookings,
+    // fare at/above minFare, capped at maxDiscount and at 50% of the fare.
+    // Invalid → 400 before any money moves, so a rider who saw "applied" on
+    // the payment screen is never silently charged the full fare.
+    let promoDiscount = 0;
+    let appliedPromo: { _id: any; code: string } | null = null;
+    const promoInput = typeof promoCode === 'string' ? promoCode.trim().toUpperCase() : '';
+    if (promoInput) {
+      const { PromoCode, Ride } = await import('../models');
+      const promo = await PromoCode.findOne({
+        code: promoInput,
+        isActive: true,
+        expiresAt: { $gt: new Date() },
+        $expr: { $lt: ['$usedCount', '$maxUses'] },
+      });
+      if (!promo) {
+        res.status(400).json({ success: false, message: 'Invalid or expired promo code' });
+        return;
+      }
+      if (promo.maxUsesPerUser && promo.maxUsesPerUser > 0) {
+        const [rideUses, seatUses] = await Promise.all([
+          Ride.countDocuments({
+            customer: req.user!._id,
+            promoCode: promo.code,
+            status: { $nin: ['cancelled'] },
+          }),
+          ScheduledBooking.countDocuments({
+            customer: req.user!._id,
+            promoCode: promo.code,
+            status: { $ne: 'cancelled' },
+          }),
+        ]);
+        if (rideUses + seatUses >= promo.maxUsesPerUser) {
+          res.status(400).json({ success: false, message: 'You have already used this promo code' });
+          return;
+        }
+      }
+      if (grossAmount < (promo.minFare ?? 0)) {
+        res.status(400).json({
+          success: false,
+          message: `This code needs a fare of ₹${promo.minFare} or more`,
+        });
+        return;
+      }
+      const cap = promo.maxDiscount && promo.maxDiscount > 0 ? promo.maxDiscount : Infinity;
+      const raw =
+        promo.type === 'percentage'
+          ? (grossAmount * Math.max(0, promo.value)) / 100
+          : Math.max(0, promo.value);
+      promoDiscount = Math.round(Math.min(raw, cap, grossAmount * 0.5) * 100) / 100;
+      appliedPromo = { _id: promo._id, code: promo.code };
+    }
+    // What is actually charged (and refunded on cancel): fare minus promo.
+    const amount = Math.max(0, Math.round((grossAmount - promoDiscount) * 100) / 100);
 
     // ── Wallet payment ──
     // When the rider pays from their UKCAAR wallet, the debit MUST happen
@@ -1160,6 +1218,9 @@ export const bookRouteSeats = async (
         customer: req.user!._id,
         status: 'reserved',
         totalAmount: amount,
+        ...(appliedPromo
+          ? { promoCode: appliedPromo.code, discount: promoDiscount, grossAmount }
+          : {}),
         // Recorded so cancellation knows whether to auto-refund the wallet.
         paymentMethod: paymentMethod === 'wallet' ? 'wallet' : 'razorpay',
         // Booked segment (stop `sequence` values) — powers the early-drop
@@ -1183,6 +1244,15 @@ export const bookRouteSeats = async (
         ).catch(() => {});
       }
       throw createErr;
+    }
+
+    // Count the redemption only once the booking exists (a failed create
+    // above already refunded the wallet and threw).
+    if (appliedPromo) {
+      const { PromoCode } = await import('../models');
+      await PromoCode.findByIdAndUpdate(appliedPromo._id, { $inc: { usedCount: 1 } }).catch(
+        () => {},
+      );
     }
 
     // Wallet statement row (best-effort — the money movement above is the

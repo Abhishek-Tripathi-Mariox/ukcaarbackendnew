@@ -3,6 +3,10 @@ import { validationResult } from 'express-validator';
 import { Ride, User, Wallet, Payment, PromoCode } from '../models';
 import { config } from '../config';
 import { getRideSettings } from '../utils/rideSettings';
+import { distanceMeters } from '../utils/routeCorridor';
+
+/** "I've arrived" is accepted only within this many metres of the pickup. */
+const ARRIVAL_RADIUS_M = 300;
 import { AuthRequest } from '../middleware/auth';
 import {
   APPROVED_DRIVER_QUERY,
@@ -15,7 +19,7 @@ import {
   loyaltyDiscountForAmount,
   consumeRedemption,
 } from '../services/loyaltyEngine';
-import { safeResolveSurge, isPickupBlocked } from '../services/surge';
+import { safeResolveSurge, isPickupBlocked, isOutsideServiceArea } from '../services/surge';
 import { sweepExpiredScheduled } from '../services/scheduledSweep';
 import { getRouteEstimate } from '../services/routing';
 import { emitToUser, emitToRide, notifyNearbyDrivers } from '../socket';
@@ -629,18 +633,28 @@ export async function finalizeRideSettlement(
   // available here"), so OnePass drivers were over-charged commission on
   // every ride even though they'd paid for the lower rate.
   let isOnePass = false;
+  // Per-driver override set by admin (PATCH /admin/drivers/:id/commission,
+  // stored as a PERCENT 0-100). It was saved but never read here, so the
+  // earnings screen showed the driver's own rate while settlement silently
+  // charged the platform default.
+  let driverRatePct: number | null = null;
   if (existing.driver) {
     const drv = await User.findById(existing.driver).select(
-      'driverProfile.isOnePass driverProfile.onePassExpiry',
+      'driverProfile.isOnePass driverProfile.onePassExpiry driverProfile.commissionRate',
     );
     const dp: any = (drv as any)?.driverProfile;
     isOnePass =
       !!dp?.isOnePass && !!dp?.onePassExpiry && new Date(dp.onePassExpiry) > new Date();
+    if (typeof dp?.commissionRate === 'number' && Number.isFinite(dp.commissionRate)) {
+      driverRatePct = Math.min(Math.max(dp.commissionRate, 0), 100);
+    }
   }
   const rideSettings = await getRideSettings();
   const commissionRate = isOnePass
     ? rideSettings.onePassCommissionRate
-    : rideSettings.commissionRate;
+    : driverRatePct !== null
+      ? driverRatePct / 100
+      : rideSettings.commissionRate;
   const commission = Math.round((existing.actualFare ?? 0) * commissionRate * 100) / 100;
   const driverEarnings =
     Math.round(((existing.actualFare ?? 0) - commission + (existing.tip ?? 0)) * 100) / 100;
@@ -710,14 +724,19 @@ export async function finalizeRideSettlement(
       { $inc: { balance: ride.driverEarnings } },
       { upsert: true, new: true },
     );
+    // Statement row is the GROSS fare (+tip). The wallet is credited with the
+    // NET (`driverEarnings`) above, and a separate 'commission' debit row is
+    // written below — so the statement reads +gross −commission = net, which
+    // equals the balance change. Writing NET here (as before) alongside the
+    // commission debit showed the commission being taken twice.
     await Payment.create({
       user: ride.driver,
       ride: ride._id,
       type: 'ride_payment',
-      amount: ride.driverEarnings,
+      amount: Math.round(((ride.actualFare ?? 0) + (ride.tip ?? 0)) * 100) / 100,
       method: 'wallet',
       status: 'completed',
-      description: `Ride earning - ${ride.rideType} (after ${Math.round(commissionRate * 100)}% commission)`,
+      description: `Ride fare - ${ride.rideType}`,
     });
     if (ride.commission > 0) {
       await Payment.create({
@@ -826,6 +845,25 @@ async function calculateFare(
 }
 
 /**
+ * Service-area geofence for instant/private rides. Returns the rider-facing
+ * message when the pickup or drop-off falls outside every active
+ * 'service_area' zone, or null when the ride is allowed — including when no
+ * such zone has been drawn yet (the geofence is opt-in per deployment).
+ */
+async function serviceAreaMessage(
+  pickup: { lat: number; lng: number },
+  dropoff?: { lat: number; lng: number } | null,
+): Promise<string | null> {
+  if (await isOutsideServiceArea(pickup.lat, pickup.lng)) {
+    return "We don't operate at this pickup location yet — it's outside our service area.";
+  }
+  if (dropoff && (await isOutsideServiceArea(dropoff.lat, dropoff.lng))) {
+    return "We don't drop off at this location yet — it's outside our service area.";
+  }
+  return null;
+}
+
+/**
  * POST /api/v1/rides/estimate
  * Get fare estimate for a ride
  */
@@ -848,6 +886,15 @@ export const estimateFare = async (req: Request, res: Response): Promise<void> =
 
     if (!pickup?.lat || !pickup?.lng || !dropoff?.lat || !dropoff?.lng) {
       res.status(400).json({ success: false, message: 'Pickup and dropoff coordinates required' });
+      return;
+    }
+
+    // Service-area geofence (only enforced once admins draw a 'service_area'
+    // zone). Fail here, before routing, so the rider sees it on SelectRide
+    // instead of after tapping Book.
+    const areaMsg = await serviceAreaMessage(pickup, dropoff);
+    if (areaMsg) {
+      res.status(400).json({ success: false, code: 'OUTSIDE_SERVICE_AREA', message: areaMsg });
       return;
     }
 
@@ -1066,6 +1113,14 @@ export const createRide = async (req: AuthRequest, res: Response): Promise<void>
           block.zone ? ` (${block.zone.name})` : ''
         }.`,
       });
+      return;
+    }
+
+    // Service-area geofence — the same check the estimate ran, repeated here
+    // so an older app build can't book outside the area.
+    const areaMsg = await serviceAreaMessage(pickup, dropoff);
+    if (areaMsg) {
+      res.status(400).json({ success: false, code: 'OUTSIDE_SERVICE_AREA', message: areaMsg });
       return;
     }
 
@@ -1890,7 +1945,7 @@ export const verifyRideOtp = async (req: AuthRequest, res: Response): Promise<vo
  */
 export const updateRideStatus = async (req: AuthRequest, res: Response): Promise<void> => {
   try {
-    const { status } = req.body;
+    const { status, lat, lng } = req.body;
     // Transitions overview:
     //   in_progress → payment_pending : driver pressed "End trip". Fare
     //     is locked in now (actualFare/Distance/Duration) but the rider
@@ -1950,6 +2005,37 @@ export const updateRideStatus = async (req: AuthRequest, res: Response): Promise
         message: `Cannot transition from ${ride.status} to ${status}`,
       });
       return;
+    }
+
+    // "I've arrived" only counts near the pickup. The app sends its GPS fix;
+    // fall back to the last socket-reported location. With no fix at all we
+    // let it through rather than strand a driver whose GPS is flaky.
+    if (status === 'driver_arrived' && !isAdmin) {
+      const pk: any = ride.pickup;
+      let here: { lat: number; lng: number } | null =
+        Number.isFinite(Number(lat)) && Number.isFinite(Number(lng))
+          ? { lat: Number(lat), lng: Number(lng) }
+          : null;
+      if (!here) {
+        const me: any = await User.findById(req.user!._id)
+          .select('driverProfile.currentLocation')
+          .lean();
+        const cl = me?.driverProfile?.currentLocation;
+        if (cl && typeof cl.lat === 'number' && typeof cl.lng === 'number') {
+          here = { lat: cl.lat, lng: cl.lng };
+        }
+      }
+      if (here && pk && typeof pk.lat === 'number' && typeof pk.lng === 'number') {
+        const away = distanceMeters(here, { lat: pk.lat, lng: pk.lng });
+        if (away > ARRIVAL_RADIUS_M) {
+          const human = away >= 1000 ? `${(away / 1000).toFixed(1)} km` : `${Math.round(away)} m`;
+          res.status(400).json({
+            success: false,
+            message: `You're still about ${human} from the pickup point. "I've arrived" unlocks within ${ARRIVAL_RADIUS_M} m.`,
+          });
+          return;
+        }
+      }
     }
 
     ride.status = status;

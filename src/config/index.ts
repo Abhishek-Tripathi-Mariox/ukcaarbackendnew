@@ -95,7 +95,9 @@ export const config = {
       electric: { base: 3.5, perKm: 1.4, perMin: 0.18 },
     },
     commissionRate: 0.20, // 20% platform commission
-    onePassCommissionRate: 0.12, // 12% for One Pass subscribers
+    // 0 = OnePass drivers pay NO platform commission (client decision, QA
+    // 2026-09). Admin-adjustable on the Fare Calculation page.
+    onePassCommissionRate: 0,
     surgeMultipliers: {
       low: 1.0,
       medium: 1.25,

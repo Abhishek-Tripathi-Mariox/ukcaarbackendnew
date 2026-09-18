@@ -100,14 +100,17 @@ export const sendOtp = async (req: Request, res: Response): Promise<void> => {
 
     // No SMS provider yet (client-testing phase). The universal test OTP
     // (config.auth.testOtp, e.g. "115566") is what testers actually use to log
-    // in; we also surface the generated per-user OTP in the response while the
-    // test flag is on, for convenience.
+    // in — it keeps working regardless of what we return here.
+    //
+    // The generated per-user OTP is NEVER returned: echoing it let anyone
+    // request a code for any phone number and read it straight back out of
+    // the response — a full account takeover on a public endpoint. It goes to
+    // the server log only (and the test OTP covers QA).
     console.log(`📱 OTP for ${fullPhone}: ${otp}`);
 
     res.status(200).json({
       success: true,
       message: 'OTP sent successfully',
-      ...(config.auth.allowTestOtp && { otp }),
     });
   } catch (error) {
     console.error('sendOtp error:', error);

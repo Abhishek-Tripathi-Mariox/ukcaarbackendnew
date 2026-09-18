@@ -53,7 +53,7 @@ export const uploadFile = async (req: AuthRequest, res: Response): Promise<void>
     // Generate unique filename. Driver registration docs go under
     // driver/{id}/docs/{type}/... so they're easy to find per-driver in S3.
     const ext = path.extname(file.originalname);
-    const DRIVER_DOC_TYPES = ['licence', 'aadhaar', 'aadhaar-front', 'aadhaar-back', 'profile-photo', 'insurance', 'vehicle', 'vehicle-photo', 'dbs', 'phv', 'puc'];
+    const DRIVER_DOC_TYPES = ['licence', 'aadhaar', 'aadhaar-front', 'aadhaar-back', 'profile-photo', 'insurance', 'vehicle', 'vehicle-photo', 'passbook', 'dbs', 'phv', 'puc'];
     const isDriverDoc = DRIVER_DOC_TYPES.includes(type);
     const key = isDriverDoc
       ? `driver/${req.user!._id}/docs/${type}/${uuidv4()}${ext}`

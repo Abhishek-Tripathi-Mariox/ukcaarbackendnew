@@ -77,6 +77,37 @@ const cacheSet = <T>(
   }
 };
 
+/**
+ * Google returns a plus-code as `formatted_address` for any place without a
+ * street number ("7XQW+MXP, ISBT, Majra, Dehradun…"). Riders don't recognise
+ * those — and Google Maps itself never shows them, it shows the place name —
+ * so we detect and replace them below.
+ */
+const PLUS_CODE_PREFIX = /^[23456789CFGHJMPQRVWX]{4,8}\+[23456789CFGHJMPQRVWX]{2,4}\b[,\s]*/i;
+
+/**
+ * Build the rider-facing label + address for a place, matching what the same
+ * search shows in Google Maps: the place NAME leads, followed by its area.
+ * `name` comes from the prediction's main text (or Place Details), `formatted`
+ * from Place Details, `description` from the prediction.
+ */
+const placeLabel = (
+  name: string,
+  formatted: string,
+  description: string,
+): { displayName: string; address: string } => {
+  const n = (name ?? '').trim();
+  const f = (formatted ?? '').trim();
+  const d = (description ?? '').trim();
+  // Prefer the prediction description when the formatted address is a plus
+  // code — the description is the exact string Google Maps renders.
+  let address = f && !PLUS_CODE_PREFIX.test(f) ? f : d || f.replace(PLUS_CODE_PREFIX, '');
+  if (n && !address.toLowerCase().startsWith(n.toLowerCase())) {
+    address = address ? `${n}, ${address}` : n;
+  }
+  return { displayName: n || address, address: address || n };
+};
+
 const router = Router();
 router.use(authenticate);
 
@@ -249,10 +280,18 @@ router.get('/autocomplete', async (req: Request, res: Response) => {
                   comps.find((c) => c.types?.includes(type))?.long_name ?? '';
                 const compShortOf = (type: string) =>
                   comps.find((c) => c.types?.includes(type))?.short_name ?? '';
+                // The place NAME is what Google Maps shows and what the rider
+                // typed; `formatted_address` alone was rendering plus-codes
+                // ("7XQW+MXP, ISBT, Majra…") instead of "ISBT Dehradun".
+                const labelled = placeLabel(
+                  p.structured_formatting?.main_text || r.name || '',
+                  r.formatted_address || '',
+                  p.description || '',
+                );
                 return {
                   id: String(p.place_id),
-                  displayName: r.formatted_address || p.description,
-                  address: r.formatted_address || p.description,
+                  displayName: labelled.displayName,
+                  address: labelled.address,
                   lat: r.geometry.location.lat,
                   lng: r.geometry.location.lng,
                   parts: {
@@ -457,11 +496,24 @@ router.get('/reverse', async (req: Request, res: Response) => {
             comps.find((c) => c.types?.includes(type))?.long_name ?? '';
           const compShortOf = (type: string) =>
             comps.find((c) => c.types?.includes(type))?.short_name ?? '';
-          const formatted = best.formatted_address as string;
+          // Same plus-code problem as autocomplete: a dropped pin in an area
+          // with no street number reverse-geocodes to "7XQW+MXP, …".
+          const rawFormatted = String(best.formatted_address ?? '');
+          const namedPlace = gJson.results.find(
+            (r: any) =>
+              Array.isArray(r.types) &&
+              (r.types.includes('point_of_interest') || r.types.includes('establishment')),
+          );
+          const labelled = placeLabel(
+            String(namedPlace?.name ?? ''),
+            rawFormatted,
+            String(namedPlace?.formatted_address ?? ''),
+          );
+          const formatted = labelled.address || rawFormatted;
           res.status(200).json({
             success: true,
             data: {
-              displayName: formatted,
+              displayName: labelled.displayName || formatted,
               address: formatted,
               lat: best.geometry?.location?.lat ?? lat,
               lng: best.geometry?.location?.lng ?? lng,
